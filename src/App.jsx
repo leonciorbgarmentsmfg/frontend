@@ -1,9 +1,10 @@
-import { isValidElement, useCallback, useEffect, useState } from 'react'
+import { isValidElement, useCallback, useEffect, useRef, useState } from 'react'
 
 const inputClass =
   'mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none focus:border-violet-500 focus:ring-2 focus:ring-violet-200'
 const paidLayoutFeeThreshold = 1
 const minimumLayoutFee = 700
+const orderPriorities = ['Urgent', 'High', 'Normal']
 const localDateInputValue = () => {
   const date = new Date()
   date.setMinutes(date.getMinutes() - date.getTimezoneOffset())
@@ -12,6 +13,7 @@ const localDateInputValue = () => {
 
 const emptyFabricEntry = {
   fabric: '',
+  fabric_width: '',
   gsm: '',
   roll_quantity: '',
   measurement_type: 'meter',
@@ -44,6 +46,34 @@ const consumableCatalog = [
   { code: 'subli_ink_legacy_atexco', business_unit: 'sublimation', label: 'Sublimation ink · Atexco · legacy (color not recorded)', unit: 'L', legacy: true },
   { code: 'subli_ink_legacy_creons', business_unit: 'sublimation', label: 'Sublimation ink · Creons · legacy (color not recorded)', unit: 'L', legacy: true },
 ]
+
+function getStationConsumableProducts(form) {
+  const sublimationBrand = getPrinterStockBrand(form.printer_brand) || form.consumable_brand || ''
+  return consumableCatalog.filter((product) => {
+    if (product.legacy || product.code.includes('_solution')) return false
+    if (product.business_unit !== (form.consumable_process === 'dtf' ? 'dtf' : 'sublimation')) return false
+    if (product.business_unit === 'sublimation' && product.code.startsWith('subli_')) {
+      return Boolean(sublimationBrand) && product.code.endsWith(`_${sublimationBrand}`)
+    }
+    return true
+  })
+}
+
+function getPrinterStockBrand(printerBrand = '') {
+  const normalizedBrand = printerBrand.toLocaleLowerCase()
+  if (normalizedBrand.includes('creons')) return 'creons'
+  if (normalizedBrand.includes('atexco')) return 'atexco'
+  return ''
+}
+
+function getStationConsumableInputUnit(product) {
+  return product.code.includes('_ink_') ? 'ml' : product.unit
+}
+
+function getInventoryQuantity(code, inputQuantity) {
+  const quantity = Number(inputQuantity)
+  return code.includes('_ink_') ? quantity / 1000 : quantity
+}
 
 function calculateFabricTotalMeters(form) {
   const rollQuantity = Number(form.roll_quantity)
@@ -101,12 +131,6 @@ function IconButton({ children, ...props }) {
       {children}
     </button>
   )
-}
-
-function decodeVapidPublicKey(value) {
-  const base64 = value.replace(/-/g, '+').replace(/_/g, '/')
-  const binary = window.atob(base64.padEnd(Math.ceil(base64.length / 4) * 4, '='))
-  return Uint8Array.from(binary, (character) => character.charCodeAt(0))
 }
 
 function uppercaseTextEntry(event) {
@@ -326,6 +350,7 @@ const emptyOrder = {
   sleeve_type: 'Raglan',
   sleeve_length: 'Short Sleeve',
   fabric: '',
+  fabric_width: '',
   gsm: '160',
   item: '',
   other_details: '',
@@ -346,6 +371,336 @@ const emptyOrder = {
     product_length: '',
     product_others: '',
   },
+}
+
+function fabricOptionKey(option) {
+  return JSON.stringify([
+    option.fabric,
+    String(option.fabric_width ?? ''),
+    String(option.gsm),
+  ])
+}
+
+function fabricOptionLabel(option) {
+  return `${option.fabric} · ${option.fabric_width || 'Width not set'} · ${option.gsm} GSM`
+}
+
+function parseConsumptionQuantity(word, unit) {
+  const match = word.replace(/,/g, '.').match(/^(\d+(?:\.\d+)?)(ml|milliliters?|cm|mm|l|meters?|m)?$/i)
+  if (!match) return null
+  const quantity = Number(match[1])
+  const suffix = (match[2] || '').toLocaleLowerCase()
+  if (unit === 'L' && (suffix === 'ml' || suffix.startsWith('milliliter'))) {
+    return String(quantity / 1000)
+  }
+  if (unit === 'ml' && (suffix === 'l' || suffix.startsWith('liter'))) {
+    return String(quantity * 1000)
+  }
+  if (unit === 'm' && suffix === 'cm') return String(quantity / 100)
+  if (unit === 'm' && suffix === 'mm') return String(quantity / 1000)
+  return String(quantity)
+}
+
+function findConsumptionImageValues(ocrData, products) {
+  const lines = (ocrData.blocks || [])
+    .flatMap((block) => block.paragraphs || [])
+    .flatMap((paragraph) => paragraph.lines || [])
+  const words = lines.flatMap((line) => (line.words || []).map((word) => ({ ...word, line })))
+  const results = {}
+  const assignedWords = new Set()
+
+  for (const product of products) {
+    const color = product.code.match(/_(cyan|magenta|yellow|black|white)(?:_|$)/)?.[1]
+    const aliasesByColor = {
+      cyan: ['cyan', 'c'],
+      magenta: ['magenta', 'm'],
+      yellow: ['yellow', 'y'],
+      black: ['black', 'bk', 'k'],
+      white: ['white', 'w'],
+    }
+    const aliases = [
+      product.label.toLocaleLowerCase(),
+      ...(color ? aliasesByColor[color] : []),
+      ...(product.code.includes('_film') ? ['film'] : []),
+      ...(product.code.includes('_paper') ? ['paper', 'length'] : []),
+      ...(product.code.includes('_solution') ? ['solution'] : []),
+    ].map((alias) => alias.replace(/[^a-z0-9]+/g, ' ').trim().split(/\s+/))
+    let labelBox = null
+    let labelLine = null
+
+    for (const line of lines) {
+      const lineWords = line.words || []
+      for (const aliasTokens of aliases) {
+        for (let start = 0; start <= lineWords.length - aliasTokens.length; start += 1) {
+          const matchesLabel = aliasTokens.every((token, index) =>
+            lineWords[start + index].text.toLocaleLowerCase().replace(/[^a-z0-9]/g, '') === token,
+          )
+          if (matchesLabel) {
+            const matchedWords = lineWords.slice(start, start + aliasTokens.length)
+            labelBox = {
+              x0: matchedWords[0].bbox.x0,
+              x1: matchedWords.at(-1).bbox.x1,
+              y0: Math.min(...matchedWords.map((word) => word.bbox.y0)),
+              y1: Math.max(...matchedWords.map((word) => word.bbox.y1)),
+            }
+            labelLine = line
+            break
+          }
+        }
+        if (labelBox) break
+      }
+      if (labelBox) break
+    }
+    if (!labelBox) continue
+
+    const quantities = words
+      .map((word, index) => {
+        const value = parseConsumptionQuantity(word.text, getStationConsumableInputUnit(product))
+        if (assignedWords.has(index) || value === null) return null
+        const verticalDistance = word.bbox.y0 > labelBox.y1
+          ? word.bbox.y0 - labelBox.y1
+          : word.bbox.y1 < labelBox.y0
+            ? labelBox.y0 - word.bbox.y1
+            : 0
+        const horizontalDistance = word.bbox.x0 > labelBox.x1
+          ? word.bbox.x0 - labelBox.x1
+          : word.bbox.x1 < labelBox.x0
+            ? labelBox.x0 - word.bbox.x1
+            : 0
+        const isToRight = word.line === labelLine &&
+          word.bbox.x0 >= labelBox.x1 - 5 &&
+          verticalDistance <= 35
+        const isBelow = !color &&
+          word.bbox.y0 >= labelBox.y1 - 5 &&
+          word.bbox.y0 <= labelBox.y1 + 100 &&
+          horizontalDistance <= 220
+        if (!isToRight && !isBelow) return null
+        return {
+          index,
+          value,
+          distance: verticalDistance * 3 + horizontalDistance,
+        }
+      })
+      .filter(Boolean)
+      .sort((left, right) => left.distance - right.distance)
+    if (quantities[0]) {
+      results[product.code] = quantities[0].value
+      assignedWords.add(quantities[0].index)
+    }
+  }
+  return results
+}
+
+function findTotalInkMilliliters(ocrResults) {
+  const text = ocrResults
+    .map((result) => result.text || '')
+    .join(' ')
+    .replace(/,/g, '.')
+    .replace(/\s+/g, ' ')
+  const patterns = [
+    /\btotal(?:\s+ink)?(?:\s+(?:used|usage|consumed|consumption))?\s*[:=-]?\s*(\d+(?:\.\d+)?)\s*(ml|milliliters?|l|liters?)\b/i,
+    /\bink\s+total(?:\s+(?:used|usage))?\s*[:=-]?\s*(\d+(?:\.\d+)?)\s*(ml|milliliters?|l|liters?)\b/i,
+    /\b(?:ink\s+)?(?:used|usage|consumed|consumption)\s*(?:total)?\s*[:=-]?\s*(\d+(?:\.\d+)?)\s*(ml|milliliters?|l|liters?)\b/i,
+    /\b(\d+(?:\.\d+)?)\s*(ml|milliliters?|l|liters?)\s+(?:of\s+)?(?:total\s+)?ink\b/i,
+  ]
+  for (const pattern of patterns) {
+    const match = text.match(pattern)
+    if (match) {
+      const quantity = Number(match[1])
+      return /^(ml|milliliters?)$/i.test(match[2]) ? quantity : quantity * 1000
+    }
+  }
+  return null
+}
+
+function findGraphInkValues(canvas, ocrResults, products, totalInkMilliliters) {
+  if (!canvas || !Number.isFinite(totalInkMilliliters) || totalInkMilliliters <= 0) return {}
+  const context = canvas.getContext('2d')
+  if (!context) return {}
+  const image = context.getImageData(0, 0, canvas.width, canvas.height)
+  const { data, width, height } = image
+  const lines = ocrResults.flatMap((result) =>
+    (result.blocks || [])
+      .flatMap((block) => block.paragraphs || [])
+      .flatMap((paragraph) => paragraph.lines || []),
+  )
+  const colorAliases = {
+    cyan: ['cyan', 'c'],
+    magenta: ['magenta', 'm'],
+    yellow: ['yellow', 'y'],
+    black: ['black', 'bk', 'k'],
+    white: ['white', 'w'],
+  }
+  const colorMatches = (offset, color) => {
+    const red = data[offset]
+    const green = data[offset + 1]
+    const blue = data[offset + 2]
+    if (color === 'cyan') return green > 115 && blue > 115 && green - red > 45 && blue - red > 45
+    if (color === 'magenta') return red > 115 && blue > 115 && red - green > 45 && blue - green > 35
+    if (color === 'yellow') return red > 145 && green > 130 && Math.min(red, green) - blue > 45
+    if (color === 'black') return Math.max(red, green, blue) < 90
+    return Math.min(red, green, blue) > 247
+  }
+  const neutralTrackPixel = (offset) => {
+    const red = data[offset]
+    const green = data[offset + 1]
+    const blue = data[offset + 2]
+    return Math.max(red, green, blue) - Math.min(red, green, blue) < 18 &&
+      red >= 90 && red < 225
+  }
+  const values = {}
+
+  for (const product of products) {
+    const color = product.code.match(/_(cyan|magenta|yellow|black|white)(?:_|$)/)?.[1]
+    if (!color) continue
+    const aliases = colorAliases[color]
+    const labelCandidates = lines.flatMap((line) =>
+      (line.words || [])
+        .filter((word) => aliases.includes(word.text.toLocaleLowerCase().replace(/[^a-z]/g, '')))
+        .map((word) => word.bbox),
+    )
+    let bestMeasurement = null
+
+    for (const label of labelCandidates) {
+      const yStart = Math.max(0, Math.floor(label.y0) - 3)
+      const yEnd = Math.min(height - 1, Math.ceil(label.y1) + 3)
+      const xStart = Math.min(width - 1, Math.ceil(label.x1) + 1)
+      const borderThreshold = Math.min(4, yEnd - yStart + 1)
+      const borderColumns = []
+      for (let x = xStart; x < width; x += 1) {
+        let borderPixels = 0
+        for (let y = yStart; y <= yEnd; y += 1) {
+          if (neutralTrackPixel((y * width + x) * 4)) borderPixels += 1
+        }
+        if (borderPixels >= borderThreshold) borderColumns.push(x)
+      }
+      const hasTrackBounds = borderColumns.length > 1 &&
+        borderColumns.at(-1) - borderColumns[0] >= 30
+      const trackStart = hasTrackBounds ? borderColumns[0] + 1 : xStart
+      const trackEnd = hasTrackBounds ? borderColumns.at(-1) - 1 : width - 1
+      if (color === 'white' && !hasTrackBounds) continue
+
+      for (let y = yStart; y <= yEnd; y += 1) {
+        if (color === 'white') {
+          let whiteEnd = trackStart - 1
+          for (let x = trackStart; x <= trackEnd; x += 1) {
+            if (colorMatches((y * width + x) * 4, color)) whiteEnd = x
+            else break
+          }
+          const whiteWidth = whiteEnd - trackStart + 1
+          if (whiteWidth >= 8) {
+            const fraction = Math.max(0, Math.min(1, whiteWidth / (trackEnd - trackStart + 1)))
+            if (!bestMeasurement || whiteWidth > bestMeasurement.runWidth) {
+              bestMeasurement = { fraction, runWidth: whiteWidth }
+            }
+          }
+          continue
+        }
+        let runStart = -1
+        let runEnd = -1
+        let bestRunStart = -1
+        let bestRunEnd = -1
+        for (let x = trackStart; x <= trackEnd; x += 1) {
+          const offset = (y * width + x) * 4
+          if (colorMatches(offset, color)) {
+            if (runStart < 0) runStart = x
+            runEnd = x
+          } else if (runStart >= 0) {
+            if (runEnd - runStart > bestRunEnd - bestRunStart) {
+              bestRunStart = runStart
+              bestRunEnd = runEnd
+            }
+            runStart = -1
+          }
+        }
+        if (runStart >= 0 && runEnd - runStart > bestRunEnd - bestRunStart) {
+          bestRunStart = runStart
+          bestRunEnd = runEnd
+        }
+        if (bestRunEnd - bestRunStart < 8) continue
+
+        let measuredTrackEnd = trackEnd
+        if (!hasTrackBounds) {
+          measuredTrackEnd = bestRunEnd
+          for (let x = bestRunEnd + 1; x < width; x += 1) {
+            if (neutralTrackPixel((y * width + x) * 4)) {
+              measuredTrackEnd = x
+            } else if (measuredTrackEnd > bestRunEnd) {
+              break
+            }
+          }
+        }
+        const fraction = Math.max(0, Math.min(1, (bestRunEnd - bestRunStart + 1) /
+          Math.max(1, measuredTrackEnd - trackStart + 1)))
+        if (!bestMeasurement || bestRunEnd - bestRunStart > bestMeasurement.runWidth) {
+          bestMeasurement = { fraction, runWidth: bestRunEnd - bestRunStart }
+        }
+      }
+    }
+    if (bestMeasurement) {
+      values[product.code] = String(Number((totalInkMilliliters * bestMeasurement.fraction).toFixed(2)))
+    }
+  }
+  return values
+}
+
+async function prepareUsageOcrImage(image) {
+  const bitmap = await createImageBitmap(image)
+  const scale = Math.min(4, 2400 / Math.max(bitmap.width, bitmap.height))
+  const canvas = document.createElement('canvas')
+  canvas.width = Math.max(1, Math.round(bitmap.width * scale))
+  canvas.height = Math.max(1, Math.round(bitmap.height * scale))
+  const labelScale = Math.min(6, 5000 / bitmap.height)
+  const labelSourceWidth = Math.max(1, Math.ceil(bitmap.width * 0.24))
+  const labelCanvas = document.createElement('canvas')
+  labelCanvas.width = Math.max(1, Math.round(labelSourceWidth * labelScale))
+  labelCanvas.height = Math.max(1, Math.round(bitmap.height * labelScale))
+  const context = canvas.getContext('2d')
+  const labelContext = labelCanvas.getContext('2d')
+  if (!context || !labelContext) {
+    bitmap.close()
+    throw new Error('This browser could not prepare the image for OCR.')
+  }
+  context.imageSmoothingEnabled = true
+  context.imageSmoothingQuality = 'high'
+  context.drawImage(bitmap, 0, 0, canvas.width, canvas.height)
+  labelContext.imageSmoothingEnabled = true
+  labelContext.imageSmoothingQuality = 'high'
+  labelContext.drawImage(
+    bitmap,
+    0,
+    0,
+    labelSourceWidth,
+    bitmap.height,
+    0,
+    0,
+    labelCanvas.width,
+    labelCanvas.height,
+  )
+  bitmap.close()
+  return { canvas, labelCanvas }
+}
+
+function FabricOptionSelect({ options, value, onChange }) {
+  const selectedOption = options.find((option) => fabricOptionLabel(option) === value)
+  return (
+    <select
+      className={inputClass}
+      onChange={(event) => {
+        const option = options.find((entry) => fabricOptionKey(entry) === event.target.value)
+        onChange(option ? fabricOptionLabel(option) : '')
+      }}
+      value={selectedOption ? fabricOptionKey(selectedOption) : value ? 'legacy' : ''}
+    >
+      <option value="">Select fabric</option>
+      {value && !selectedOption && <option value="legacy">{value} (existing)</option>}
+      {options.map((option) => (
+        <option key={fabricOptionKey(option)} value={fabricOptionKey(option)}>
+          {fabricOptionLabel(option)}
+        </option>
+      ))}
+    </select>
+  )
 }
 
 const styleNumberFields = [
@@ -599,7 +954,7 @@ function printOrder(orderId) {
           <div class="titlebar"><div class="title">ORDER FORM</div><div class="brand">B-POWER</div><div class="order-id">ORDER NO: ${escapeHtml(order.order_id)}</div></div>
           <div class="meta">
             ${field('Date', order.order_date, 'wide')}${field('Deadline', order.due_date)}${field('Artist', artist_name)}
-            ${field('Client name', client?.company_name || order.client_id, 'wide')}${field('Fabric', order.fabric)}${field('GSM', order.gsm)}
+            ${field('Client name', client?.company_name || order.client_id, 'wide')}${field('Fabric', order.fabric)}${field('Fabric width', order.fabric_width || '—')}${field('GSM', order.gsm)}
             ${field('Team / project', order.team_project_name, 'wide')}${field('Total qty', order.total_quantity)}${field('Neck label', 'SIZE ONLY')}
             ${field('Printer', order.printer_machine, 'wide')}${field('Rotary press', order.pressing_machine)}${field('Cutting', order.cutting_machine)}
             ${field('Item', order.item, 'wide')}${field('Style number', order.style_number, 'wide')}
@@ -671,14 +1026,48 @@ function Field({ label, children }) {
   )
 }
 
-function OrderEditFields({ form, onChange, clients, staff, artistOptions, machines, styleNumberOptions, includeFinancials, isAdmin }) {
+function NotificationBanner({ notification, onDismiss }) {
+  if (!notification) return null
+  const styles = {
+    error: 'border-red-300 bg-red-950 text-white',
+    warning: 'border-amber-300 bg-amber-100 text-amber-950',
+    success: 'border-emerald-300 bg-emerald-950 text-white',
+  }[notification.type]
+  const role = notification.type === 'success' ? 'status' : 'alert'
+
+  return (
+    <div aria-live={notification.type === 'success' ? 'polite' : 'assertive'} className={`border-b ${styles}`} role={role}>
+      <div className="mx-auto flex w-full items-center gap-4 px-4 py-2.5 text-sm sm:px-6 lg:px-8">
+        <div aria-label={notification.message} className="notification-marquee min-w-0 flex-1">
+          <div className="notification-marquee__track">
+            <span>{notification.message}</span>
+            <span aria-hidden="true">{notification.message}</span>
+          </div>
+        </div>
+        <button
+          aria-label="Dismiss notification"
+          className="shrink-0 rounded px-2 py-1 font-semibold hover:bg-white/10"
+          onClick={onDismiss}
+          type="button"
+        >
+          × Dismiss
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function OrderEditFields({ form, onChange, clients, staff, artistOptions, machines, styleNumberOptions, fabricOptions, includeFinancials, isAdmin }) {
   const selectFields = {
     client_id: ['Client', clients.map((client) => [client.client_id, client.company_name])],
     assigned_artist_id: [
       'Assigned artist',
       artistOptions.map((artist) => [String(artist.id), artist.name]),
     ],
-    printer_machine: ['Printer machine', machines.filter((machine) => machine.category === 'printing').map((machine) => [machine.name, machine.name])],
+    printer_machine: ['Printer brand', machines.filter((machine) =>
+      machine.category === 'printing' &&
+      (machine.business_unit == null || machine.business_unit === (form.business_unit || 'sublimation')),
+    ).map((machine) => [machine.name, machine.name])],
     pressing_machine: ['Pressing machine', machines.filter((machine) => machine.category === 'pressing').map((machine) => [machine.name, machine.name])],
     cutting_machine: ['Cutting machine', machines.filter((machine) => machine.category === 'cutting').map((machine) => [machine.name, machine.name])],
   }
@@ -793,11 +1182,36 @@ function OrderEditFields({ form, onChange, clients, staff, artistOptions, machin
           </select>
         </Field>
       ))}
-      <Field label="Fabric">
-        <input className={inputClass} onChange={(event) => onChange('fabric', event.target.value)} required value={form.fabric ?? ''} />
-      </Field>
-      <Field label="GSM">
-        <input className={inputClass} min="1" onChange={(event) => onChange('gsm', event.target.value)} required type="number" value={form.gsm ?? ''} />
+      <Field label="Fabric / width / GSM">
+        <select
+          className={inputClass}
+          onChange={(event) => {
+            const option = fabricOptions.find((entry) => fabricOptionKey(entry) === event.target.value)
+            if (option) {
+              onChange('fabric', option.fabric)
+              onChange('fabric_width', option.fabric_width ?? '')
+              onChange('gsm', String(option.gsm))
+            }
+          }}
+          required
+          value={fabricOptions.some((option) =>
+            option.fabric === form.fabric &&
+            String(option.fabric_width ?? '') === String(form.fabric_width ?? '') &&
+            String(option.gsm) === String(form.gsm),
+          ) ? fabricOptionKey({
+            fabric: form.fabric,
+            fabric_width: form.fabric_width,
+            gsm: form.gsm,
+          }) : 'legacy'}
+        >
+          <option value="">Select fabric, width, and GSM</option>
+          {form.fabric && <option value="legacy">{fabricOptionLabel(form)} (existing)</option>}
+          {fabricOptions.map((option) => (
+            <option key={fabricOptionKey(option)} value={fabricOptionKey(option)}>
+              {fabricOptionLabel(option)}
+            </option>
+          ))}
+        </select>
       </Field>
       {textFields.map(([name, label, type]) => (
         <Field key={name} label={label}>
@@ -825,6 +1239,7 @@ function OrderEntryForm({
   artistOptions,
   machines,
   styleNumberOptions,
+  fabricOptions,
   isAdmin,
   isSalesOrAdmin,
   setLineupFile,
@@ -930,11 +1345,41 @@ function OrderEntryForm({
           </Field>
         )
       })}
-      <Field label="Fabric">
-        <input className={inputClass} onChange={(event) => setField('fabric', event.target.value)} required value={orderForm.fabric} />
-      </Field>
-      <Field label="GSM">
-        <input className={inputClass} min="1" onChange={(event) => setField('gsm', event.target.value)} required type="number" value={orderForm.gsm} />
+      <Field label="Fabric / width / GSM">
+        <select
+          className={inputClass}
+          onChange={(event) => {
+            const option = fabricOptions.find((entry) => fabricOptionKey(entry) === event.target.value)
+            if (option) {
+              setOrderForm((current) => ({
+                ...current,
+                fabric: option.fabric,
+                fabric_width: option.fabric_width ?? '',
+                gsm: String(option.gsm),
+              }))
+            }
+          }}
+          required
+          value={fabricOptions.some((option) =>
+            option.fabric === orderForm.fabric &&
+            String(option.fabric_width ?? '') === String(orderForm.fabric_width ?? '') &&
+            String(option.gsm) === String(orderForm.gsm),
+          ) ? fabricOptionKey({
+            fabric: orderForm.fabric,
+            fabric_width: orderForm.fabric_width,
+            gsm: orderForm.gsm,
+          }) : ''}
+        >
+          <option value="">Select fabric, width, and GSM</option>
+          {fabricOptions.map((option) => (
+            <option key={fabricOptionKey(option)} value={fabricOptionKey(option)}>
+              {fabricOptionLabel(option)}
+            </option>
+          ))}
+        </select>
+        {fabricOptions.length === 0 && (
+          <span className="mt-1 block text-xs text-amber-700">Add a fabric record to Fabric inventory before creating an order.</span>
+        )}
       </Field>
       {isAdmin && (
         <Field label="Sales representative">
@@ -950,10 +1395,11 @@ function OrderEntryForm({
           {artistOptions.map((artist) => <option key={artist.id} value={artist.id}>{artist.name}</option>)}
         </select>
       </Field>
-      <Field label="Printer machine">
+      <Field label="Printer brand">
         <select className={inputClass} disabled={!layoutFeePaid} onChange={(event) => setField('printer_machine', event.target.value)} required={layoutFeePaid} value={orderForm.printer_machine}>
-          <option value="">Select a printer machine</option>
-          {machines.filter((machine) => machine.category === 'printing').map((machine) => <option key={machine.id} value={machine.name}>{machine.name}</option>)}
+          <option value="">Select a printer brand</option>
+          {machines.filter((machine) => machine.category === 'printing' &&
+            (machine.business_unit == null || machine.business_unit === (orderForm.business_unit || 'sublimation'))).map((machine) => <option key={machine.id} value={machine.name}>{machine.name}</option>)}
         </select>
       </Field>
       <Field label="Pressing machine">
@@ -1054,7 +1500,7 @@ function printCompletedOrder(order, activity) {
       .files{margin-top:8px}.file-link{font-size:10px;margin-right:10px}
       @page{size:A4 portrait;margin:8mm}@media print{body{padding:0}tr{break-inside:avoid}h2{break-after:avoid}}
     </style></head><body>
-    <h1>Completed Order · ${escapeHtml(order.order_id)}</h1>
+    <h1>Order · ${escapeHtml(order.order_id)}</h1>
     <p>${escapeHtml(order.team_project_name)} · ${escapeHtml(stageLabelsForPrint[order.order_status] || order.order_status)}</p>
     <h2>Order details</h2><dl class="details">
       ${[
@@ -1062,6 +1508,8 @@ function printCompletedOrder(order, activity) {
         ['Team / project', order.team_project_name],
         ['Order date', order.order_date],
         ['Due date', order.due_date],
+        ['Print process', order.business_unit === 'dtf' ? 'DTF' : 'Sublimation'],
+        ['Print mode', order.print_mode === 'print_only' ? 'Print only' : 'Print and press'],
         ['Style number', order.style_number],
         ['Style / cut', `${order.style} / ${order.cut}`],
         ['Neck', order.neck],
@@ -1076,7 +1524,7 @@ function printCompletedOrder(order, activity) {
         ]),
         ['Packed pieces', order.packed_quantity ?? '—'],
         ['Sales representative', order.sales_rep_name || '—'],
-        ['Printer machine', order.printer_machine || '—'],
+        ['Printer brand', order.printer_machine || '—'],
         ['Pressing machine', order.pressing_machine || '—'],
         ['Cutting machine', order.cutting_machine || '—'],
         ['Sizing notes', order.sizing_notes || '—'],
@@ -1089,6 +1537,9 @@ function printCompletedOrder(order, activity) {
       ${order.spreadsheet_path
         ? `<a class="file-link" href="/api/orders/${encodeURIComponent(order.order_id)}/files/lineup">Open line-up file</a>`
         : ''}
+      ${order.production_spreadsheet_path
+        ? `<a class="file-link" href="/api/orders/${encodeURIComponent(order.order_id)}/files/production-spreadsheet">Open printing production spreadsheet</a>`
+        : ''}
     </div>
     <h2>TRD history</h2>
     ${events.length ? `<table><thead><tr><th>Event</th><th>Stage transition</th><th>By</th><th>Date</th><th>Details</th></tr></thead><tbody>
@@ -1097,8 +1548,10 @@ function printCompletedOrder(order, activity) {
         <td>${escapeHtml(event.actor_name)}</td><td>${escapeHtml(event.created_at)}</td><td>${escapeHtml(event.details || '—')}</td></tr>`).join('')}
       </tbody></table>` : '<p>No TRD events recorded.</p>'}
     <h2>Order consumption</h2>
-    ${logs.length ? `<table><thead><tr><th>Stage</th><th>Fabric used</th><th>Paper used</th><th>Operator</th><th>Date</th><th>Defect / issue</th></tr></thead><tbody>
+    ${logs.length ? `<table><thead><tr><th>Stage</th><th>Printer brand</th><th>Inputs</th><th>Fabric used</th><th>Paper used</th><th>Operator</th><th>Date</th><th>Defect / issue</th></tr></thead><tbody>
       ${logs.map((entry) => `<tr><td>${escapeHtml(stageLabelsForPrint[entry.station] || entry.station)}</td>
+        <td>${escapeHtml(entry.printer_brand || '—')}</td>
+        <td>${escapeHtml((entry.production_items || []).map((item) => `${item.label}: ${item.quantity} ${item.unit}`).join(', ') || '—')}</td>
         <td>${escapeHtml(entry.fabric_used || '—')}</td><td>${escapeHtml(`${Number(entry.paper_meters || 0)} m`)}</td>
         <td>${escapeHtml(entry.operator)}</td><td>${escapeHtml(entry.created_at)}</td>
         <td>${escapeHtml(entry.defect_description || '—')}</td></tr>`).join('')}
@@ -1118,10 +1571,28 @@ function App() {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [newPassword, setNewPassword] = useState('')
-  const [loginError, setLoginError] = useState('')
-  const [pageError, setPageError] = useState('')
-  const [notice, setNotice] = useState('')
+  const [notification, setNotification] = useState(null)
+  const setPageError = useCallback((messageOrUpdater) => {
+    setNotification((current) => {
+      const currentError = current?.type === 'error' ? current.message : ''
+      const nextMessage = typeof messageOrUpdater === 'function'
+        ? messageOrUpdater(currentError)
+        : messageOrUpdater
+      return nextMessage
+        ? { type: 'error', message: nextMessage }
+        : current?.type === 'error' ? null : current
+    })
+  }, [])
+  const setLoginError = setPageError
+  const setNotice = useCallback((message) => {
+    setNotification((current) => message
+      ? { type: 'success', message }
+      : current?.type === 'success' ? null : current)
+  }, [])
   const [orders, setOrders] = useState([])
+  const [priorityOrders, setPriorityOrders] = useState([])
+  const [ocrStatusByOrder, setOcrStatusByOrder] = useState({})
+  const previousOrderStages = useRef(null)
   const [activeView, setActiveView] = useState('all')
   const [artistMockupStage, setArtistMockupStage] = useState('creating')
   const [printingStage, setPrintingStage] = useState('printing')
@@ -1136,6 +1607,7 @@ function App() {
   const [artistOptions, setArtistOptions] = useState([])
   const [machines, setMachines] = useState([])
   const [fabricEntries, setFabricEntries] = useState([])
+  const [fabricOptions, setFabricOptions] = useState([])
   const [fabricFilters, setFabricFilters] = useState({ date: '', fabric: '' })
   const [fabricEntryForm, setFabricEntryForm] = useState(emptyFabricEntry)
   const [editingFabricEntryId, setEditingFabricEntryId] = useState(null)
@@ -1143,15 +1615,18 @@ function App() {
   const [styleNumberOptions, setStyleNumberOptions] = useState([])
   const [newStyleOptions, setNewStyleOptions] = useState({})
   const [newMachineNames, setNewMachineNames] = useState({
-    printing: '',
+    printing_dtf: '',
+    printing_sublimation: '',
     pressing: '',
     cutting: '',
   })
   const [editingMachineId, setEditingMachineId] = useState(null)
   const [editingMachineName, setEditingMachineName] = useState('')
+  const [editingMachineBusinessUnit, setEditingMachineBusinessUnit] = useState('sublimation')
   const [report, setReport] = useState(null)
   const [reportDrilldown, setReportDrilldown] = useState(null)
   const [consumablesReport, setConsumablesReport] = useState({ inventory: [], transactions: [] })
+  const [editingConsumableTransactionId, setEditingConsumableTransactionId] = useState(null)
   const [consumableForm, setConsumableForm] = useState({
     business_unit: 'sublimation',
     consumable_code: 'subli_ink_cyan_atexco',
@@ -1163,6 +1638,24 @@ function App() {
   const [reprints, setReprints] = useState([])
   const [testPrintJobs, setTestPrintJobs] = useState([])
   const [orderForm, setOrderForm] = useState(emptyOrder)
+  const [supervisorOrderForm, setSupervisorOrderForm] = useState({
+    client_id: '',
+    team_project_name: '',
+    due_date: localDateInputValue(),
+    item: '',
+    total_quantity: '',
+    business_unit: 'sublimation',
+    print_mode: 'print_only',
+    printer_machine: '',
+    pressing_machine: '',
+  })
+  const [isSupervisorOrderModalOpen, setIsSupervisorOrderModalOpen] = useState(false)
+  const [isAdminOrderSetupOpen, setIsAdminOrderSetupOpen] = useState(false)
+  const [isAdminDirectOrderModalOpen, setIsAdminDirectOrderModalOpen] = useState(false)
+  const [adminOrderSetup, setAdminOrderSetup] = useState({
+    business_unit: 'sublimation',
+    order_type: 'full_subli',
+  })
   const [isOrderModalOpen, setIsOrderModalOpen] = useState(false)
   const [orderModalClient, setOrderModalClient] = useState(null)
   const [clientForm, setClientForm] = useState({
@@ -1212,6 +1705,16 @@ function App() {
   const [activity, setActivity] = useState({})
   const [completedOrderDetails, setCompletedOrderDetails] = useState(null)
   const [busy, setBusy] = useState(false)
+  const [databaseForm, setDatabaseForm] = useState({
+    export_file_name: '',
+    import_file_name: '',
+    import_file: null,
+    import_mode: 'replace',
+  })
+
+  const showNotice = useCallback((message) => {
+    setNotice(message)
+  }, [setNotice])
 
   function restoreUserTheme(currentUser) {
     const savedTheme = window.localStorage.getItem(`bpsms-theme-${currentUser.id}`)
@@ -1221,18 +1724,9 @@ function App() {
 
   async function initializeUser(currentUser) {
     setActiveView(defaultViewByRole[currentUser.role] || 'all')
-    const supervisorBusinessUnit = currentUser.business_unit === 'dtf' ? 'dtf' : 'sublimation'
-    setReportTab(currentUser.role === 'supervisor' ? supervisorBusinessUnit : 'overview')
-    if (currentUser.role === 'supervisor') {
-      const firstProduct = consumableCatalog.find(
-        (product) => product.business_unit === supervisorBusinessUnit,
-      )
-      setConsumableForm((current) => ({
-        ...current,
-        business_unit: supervisorBusinessUnit,
-        consumable_code: firstProduct.code,
-      }))
-    }
+    setReportTab(currentUser.role === 'supervisor'
+      ? currentUser.business_unit === 'dtf' ? 'dtf' : 'overview'
+      : currentUser.role === 'print_operator' ? 'sublimation' : 'overview')
     restoreUserTheme(currentUser)
     if (['print_operator', 'pressing_operator', 'cutting_operator'].includes(currentUser.role)) {
       const category = stationByRole[currentUser.role]
@@ -1323,28 +1817,43 @@ function App() {
   }, [theme, user?.id, themeLoadedForUser])
 
   const loadWorkspace = useCallback(async (currentUser) => {
-    const [ordersData, fabricData] = await Promise.all([
-      currentUser.role === 'supervisor'
-        ? Promise.resolve({ orders: [] })
-        : api('/api/orders'),
-      ['admin', 'pressing_operator'].includes(currentUser.role) ||
-        (currentUser.role === 'supervisor' && currentUser.business_unit === 'sublimation')
+    const [ordersData, fabricData, fabricOptionsData, priorityData] = await Promise.all([
+      api('/api/orders'),
+      ['admin', 'supervisor', 'pressing_operator'].includes(currentUser.role)
         ? api('/api/fabric-inventory')
         : Promise.resolve({ entries: [] }),
+      api('/api/fabric-inventory/options'),
+      api('/api/order-priorities'),
     ])
     setOrders(ordersData.orders)
     setFabricEntries(fabricData.entries)
+    setFabricOptions(fabricOptionsData.options)
+    setPriorityOrders(priorityData.orders)
+    const currentStages = Object.fromEntries(
+      priorityData.orders.map((order) => [order.order_id, order.order_status]),
+    )
+    const stageSnapshot = previousOrderStages.current
+    if (stageSnapshot?.userId === currentUser.id) {
+      const advancedOrder = priorityData.orders.find((order) =>
+        stageSnapshot.stages[order.order_id] &&
+        stageSnapshot.stages[order.order_id] !== order.order_status,
+      )
+      if (advancedOrder) {
+        showNotice(`Order ${advancedOrder.order_id} advanced to ${stageLabels[advancedOrder.order_status] || advancedOrder.order_status}.`)
+      }
+    }
+    previousOrderStages.current = { userId: currentUser.id, stages: currentStages }
 
-    const isSalesOrAdmin = ['admin', 'sales'].includes(currentUser.role)
+    const isSalesOrAdmin = ['admin', 'sales', 'supervisor'].includes(currentUser.role)
     if (isSalesOrAdmin) {
       const [clientsData, reportsData, peopleData, artistsData, machinesData, styleOptionsData, consumablesData] = await Promise.all([
         api('/api/clients'),
         api('/api/reports'),
-        currentUser.role === 'admin' ? api('/api/staff') : api('/api/artists'),
+        ['admin', 'supervisor'].includes(currentUser.role) ? api('/api/staff') : api('/api/artists'),
         api('/api/artists'),
         api('/api/settings/machines'),
         api('/api/settings/style-number-options'),
-        currentUser.role === 'admin'
+        ['admin', 'supervisor'].includes(currentUser.role)
           ? api('/api/consumables')
           : Promise.resolve({ inventory: [], transactions: [] }),
       ])
@@ -1355,8 +1864,8 @@ function App() {
       setMachines(machinesData.machines)
       setStyleNumberOptions(styleOptionsData.options)
       setConsumablesReport(consumablesData)
-    } else if (currentUser.role === 'supervisor') {
-      const consumablesData = await api('/api/consumables')
+    } else if (currentUser.role === 'print_operator') {
+      const consumablesData = await api('/api/consumables?business_unit=sublimation')
       setClients([])
       setReport(null)
       setStaff([])
@@ -1374,7 +1883,7 @@ function App() {
       setConsumablesReport({ inventory: [], transactions: [] })
     }
 
-    if (['admin', 'print_operator'].includes(currentUser.role)) {
+    if (['admin', 'supervisor', 'print_operator'].includes(currentUser.role)) {
       const [reprintData, testPrintData] = await Promise.all([
         api('/api/reprints'),
         api('/api/test-prints'),
@@ -1386,7 +1895,41 @@ function App() {
       setTestPrintJobs([])
     }
 
-  }, [])
+  }, [showNotice])
+
+  useEffect(() => {
+    if (!('serviceWorker' in navigator)) return undefined
+    let active = true
+    async function removeLegacyPushSubscriptions() {
+      const registrations = await navigator.serviceWorker.getRegistrations()
+      const failures = (await Promise.all(registrations.map(async (registration) => {
+        const registrationFailures = []
+        try {
+          const subscription = await registration.pushManager.getSubscription()
+          if (subscription && !await subscription.unsubscribe()) {
+            registrationFailures.push('Could not remove a browser push subscription')
+          }
+        } catch (error) {
+          registrationFailures.push(error.message)
+        }
+        try {
+          await registration.unregister()
+        } catch (error) {
+          registrationFailures.push(error.message)
+        }
+        return registrationFailures
+      }))).flat()
+      if (failures.length > 0) {
+        throw new Error(failures.join('; '))
+      }
+    }
+    removeLegacyPushSubscriptions().catch((error) => {
+      if (active) setPageError(`Unable to remove old browser notifications: ${error.message}`)
+    })
+    return () => {
+      active = false
+    }
+  }, [setPageError])
 
   useEffect(() => {
     api('/api/auth/me')
@@ -1398,7 +1941,7 @@ function App() {
         }
       })
       .finally(() => setCheckingSession(false))
-  }, [])
+  }, [setLoginError])
 
   useEffect(() => {
     if (!user) return
@@ -1414,7 +1957,7 @@ function App() {
     return () => {
       active = false
     }
-  }, [user, loadWorkspace])
+  }, [user, loadWorkspace, setPageError])
 
   useEffect(() => {
     if (!user) return undefined
@@ -1438,54 +1981,40 @@ function App() {
 
     const intervalId = window.setInterval(refreshVisibleWorkspace, 5000)
     return () => window.clearInterval(intervalId)
-  }, [user, loadWorkspace, busy])
+  }, [user, loadWorkspace, busy, setPageError])
 
   useEffect(() => {
-    if (!user || !window.isSecureContext || !('Notification' in window) || !('serviceWorker' in navigator) || !('PushManager' in window)) return undefined
-    let active = true
-    async function enableBrowserPushNotifications() {
-      const permission = Notification.permission === 'default'
-        ? await Notification.requestPermission()
-        : Notification.permission
-      if (permission !== 'granted') return
-      const registration = await navigator.serviceWorker.register('/sw.js')
-      const existingSubscription = await registration.pushManager.getSubscription()
-      const { publicKey } = await api('/api/notifications/public-key')
-      const subscription = existingSubscription || await registration.pushManager.subscribe({
-        userVisibleOnly: true,
-        applicationServerKey: decodeVapidPublicKey(publicKey),
-      })
-      await api('/api/notifications/subscribe', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(subscription),
-      })
-    }
-    enableBrowserPushNotifications().catch((error) => {
-      if (active) setPageError(`Unable to restore browser notifications: ${error.message}`)
-    })
+    if (!reportDrilldown) return undefined
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
     return () => {
-      active = false
+      document.body.style.overflow = previousOverflow
     }
-  }, [user])
+  }, [reportDrilldown])
 
   useEffect(() => {
-    if (!isClientModalOpen && !isOrderModalOpen && !isStaffModalOpen && !isFabricEntryModalOpen) return undefined
+    if (!isClientModalOpen && !isOrderModalOpen && !isAdminOrderSetupOpen &&
+      !isAdminDirectOrderModalOpen && !isStaffModalOpen && !isFabricEntryModalOpen &&
+      !reportDrilldown) return undefined
 
     function handleEscape(event) {
       if (event.key === 'Escape') {
         setIsClientModalOpen(false)
         setIsOrderModalOpen(false)
+        setIsAdminOrderSetupOpen(false)
+        setIsAdminDirectOrderModalOpen(false)
         setIsStaffModalOpen(false)
         setIsFabricEntryModalOpen(false)
         setEditingFabricEntryId(null)
         setEditingStaffId(null)
+        setReportDrilldown(null)
       }
     }
 
     window.addEventListener('keydown', handleEscape)
     return () => window.removeEventListener('keydown', handleEscape)
-  }, [isClientModalOpen, isOrderModalOpen, isStaffModalOpen, isFabricEntryModalOpen])
+  }, [isClientModalOpen, isOrderModalOpen, isAdminOrderSetupOpen, isAdminDirectOrderModalOpen,
+    isStaffModalOpen, isFabricEntryModalOpen, reportDrilldown])
 
   async function handleLogin(event) {
     event.preventDefault()
@@ -1512,9 +2041,11 @@ function App() {
       setUser(null)
       setMachineSelection(null)
       setOrders([])
+      setPriorityOrders([])
+      previousOrderStages.current = null
       setUsername('')
       setPassword('')
-      setNotice('')
+      setNotification(null)
     } catch (error) {
       setPageError(error.message)
     }
@@ -1526,7 +2057,7 @@ function App() {
     try {
       await action()
       if (user) await loadWorkspace(user)
-      setNotice(successMessage)
+      showNotice(successMessage)
       return true
     } catch (error) {
       let message = error.message
@@ -1542,6 +2073,17 @@ function App() {
     } finally {
       setBusy(false)
     }
+  }
+
+  async function updateOrderPriority(order, orderPriority) {
+    await runAction(
+      () => api(`/api/orders/${encodeURIComponent(order.order_id)}/priority`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ order_priority: orderPriority }),
+      }),
+      `${order.order_id} priority set to ${orderPriority}.`,
+    )
   }
 
   async function createClient(event) {
@@ -1601,14 +2143,14 @@ function App() {
     const layoutFee = Number(orderForm.layout_fee || 0)
     if (!Number.isFinite(layoutFee) || layoutFee < 0 ||
       (layoutFee > 0 && layoutFee < minimumLayoutFee)) {
-      window.alert('Layout fee must be 0 or at least 700. The order was not saved.')
+      setPageError('Layout fee must be 0 or at least 700. The order was not saved.')
       return
     }
     if (layoutFee > 0 &&
       (orderForm.per_piece_price === '' ||
         !Number.isFinite(Number(orderForm.per_piece_price)) ||
         Number(orderForm.per_piece_price) < 0)) {
-      window.alert('Enter a valid per-piece price before saving this order.')
+      setPageError('Enter a valid per-piece price before saving this order.')
       return
     }
     await runAction(async () => {
@@ -1669,21 +2211,176 @@ function App() {
     }, 'Order saved. It will remain out of the Artist mock-up queue until the layout fee is paid.')
   }
 
+  async function createSupervisorOrder(event) {
+    event.preventDefault()
+    await runAction(async () => {
+      await api('/api/orders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...supervisorOrderForm,
+          ...(isAdminDirectOrderModalOpen ? { direct_print: true } : {}),
+          total_quantity: Number(supervisorOrderForm.total_quantity),
+          pressing_machine: supervisorOrderForm.print_mode === 'print_press'
+            ? supervisorOrderForm.pressing_machine
+            : '',
+        }),
+      })
+      setIsSupervisorOrderModalOpen(false)
+      setIsAdminDirectOrderModalOpen(false)
+      setSupervisorOrderForm({
+        client_id: '',
+        team_project_name: '',
+        due_date: localDateInputValue(),
+        item: '',
+        total_quantity: '',
+        business_unit: 'sublimation',
+        print_mode: 'print_only',
+        printer_machine: '',
+        pressing_machine: '',
+      })
+    }, 'Order created and moved directly to Printing.')
+  }
+
+  function openSupervisorOrderForClient(client = null) {
+    setSupervisorOrderForm((current) => ({
+      ...current,
+      client_id: client?.client_id ?? '',
+      business_unit: user.business_unit,
+      print_mode: 'print_only',
+      pressing_machine: '',
+    }))
+    setIsSupervisorOrderModalOpen(true)
+  }
+
+  async function exportDatabase(event) {
+    event.preventDefault()
+    await runAction(async () => {
+      const filename = databaseForm.export_file_name.trim()
+      const response = await fetch(
+        `/api/settings/database/export?file_name=${encodeURIComponent(filename)}`,
+      )
+      if (!response.ok) {
+        const data = await response.json()
+        throw new Error(data.error || 'Unable to export the database')
+      }
+      const blob = await response.blob()
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = filename.toLocaleLowerCase().endsWith('.db')
+        ? filename
+        : `${filename}.db`
+      link.click()
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+    }, 'Database exported.')
+  }
+
+  async function importDatabase(event) {
+    event.preventDefault()
+    const filename = databaseForm.import_file_name.trim()
+    if (!databaseForm.import_file) {
+      setPageError('Select the SQLite database file to import.')
+      return
+    }
+    const replacing = databaseForm.import_mode === 'replace'
+    if (!window.confirm(
+      replacing
+        ? 'Replace the current database with this file? Current records and sessions will be replaced; you will need to sign in again.'
+        : 'Merge this database into the current database? Rows with matching keys will be replaced, and unrelated current rows will remain.',
+    )) {
+      return
+    }
+    setBusy(true)
+    setPageError('')
+    try {
+      const formData = new FormData()
+      formData.append('file_name', filename)
+      formData.append('mode', databaseForm.import_mode)
+      formData.append('database', databaseForm.import_file)
+      const result = await api('/api/settings/database/import', {
+        method: 'POST',
+        body: formData,
+      })
+      setDatabaseForm((current) => ({
+        ...current,
+        import_file: null,
+        import_file_name: '',
+      }))
+      const fileInput = document.getElementById('database-import-file')
+      if (fileInput instanceof HTMLInputElement) fileInput.value = ''
+      if (replacing) {
+        showNotice(result.message)
+        window.setTimeout(() => window.location.reload(), 1500)
+      } else {
+        await loadWorkspace(user)
+        showNotice(result.message)
+      }
+    } catch (error) {
+      setPageError(error.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   function openOrderModalForClient(client) {
     setOrderForm({
       ...emptyOrder,
-      client_id: client.client_id,
-      sales_rep_id: String(client.sales_rep_id ?? ''),
+      client_id: client?.client_id ?? '',
+      sales_rep_id: String(client?.sales_rep_id ?? ''),
     })
     setLineupFile(null)
     setLineupDraft(null)
     setLineupInputKey((key) => key + 1)
     setOrderModalClient(client)
+    if (isDtfSupervisor) {
+      setAdminOrderSetup({ business_unit: 'dtf', order_type: 'dtf' })
+      setIsAdminOrderSetupOpen(true)
+      return
+    }
+    if (isBPowerSupervisor) {
+      setAdminOrderSetup({ business_unit: 'sublimation', order_type: 'full_subli' })
+      setOrderForm((current) => ({ ...current, business_unit: 'sublimation' }))
+      setIsOrderModalOpen(true)
+      return
+    }
+    if (isAdmin) {
+      setAdminOrderSetup({ business_unit: 'sublimation', order_type: 'full_subli' })
+      setIsAdminOrderSetupOpen(true)
+      return
+    }
     setIsOrderModalOpen(true)
+  }
+
+  function continueAdminOrderSetup() {
+    if (adminOrderSetup.order_type === 'full_subli') {
+      setOrderForm((current) => ({
+        ...current,
+        business_unit: 'sublimation',
+      }))
+      setIsAdminOrderSetupOpen(false)
+      setIsOrderModalOpen(true)
+      return
+    }
+    setSupervisorOrderForm({
+      client_id: orderModalClient?.client_id ?? '',
+      team_project_name: '',
+      due_date: localDateInputValue(),
+      item: '',
+      total_quantity: '',
+      business_unit: adminOrderSetup.business_unit,
+      print_mode: adminOrderSetup.order_type === 'print_press' ? 'print_press' : 'print_only',
+      printer_machine: '',
+      pressing_machine: '',
+    })
+    setIsAdminOrderSetupOpen(false)
+    setIsAdminDirectOrderModalOpen(true)
   }
 
   function closeOrderModal() {
     setIsOrderModalOpen(false)
+    setIsAdminOrderSetupOpen(false)
+    setIsAdminDirectOrderModalOpen(false)
     setOrderModalClient(null)
     setOrderForm(emptyOrder)
     setLineupFile(null)
@@ -1716,14 +2413,14 @@ function App() {
     const layoutFee = Number(orderEditForm.layout_fee || 0)
     if (!Number.isFinite(layoutFee) || layoutFee < 0 ||
       (layoutFee > 0 && layoutFee < minimumLayoutFee)) {
-      window.alert('Layout fee must be 0 or at least 700. The order was not saved.')
+      setPageError('Layout fee must be 0 or at least 700. The order was not saved.')
       return
     }
     if (layoutFee > 0 &&
       (orderEditForm.per_piece_price === '' ||
         !Number.isFinite(Number(orderEditForm.per_piece_price)) ||
         Number(orderEditForm.per_piece_price) < 0)) {
-      window.alert('Enter a valid per-piece price before saving this order.')
+      setPageError('Enter a valid per-piece price before saving this order.')
       return
     }
     await runAction(async () => {
@@ -1758,7 +2455,7 @@ function App() {
     if (!paymentOrder) return
     const layoutFee = Number(paymentForm.layout_fee)
     if (!Number.isFinite(layoutFee) || layoutFee < minimumLayoutFee) {
-      window.alert('Layout fee must be at least 700. Payments were not saved.')
+      setPageError('Layout fee must be at least 700. Payments were not saved.')
       return
     }
     const updated = await runAction(
@@ -1794,7 +2491,6 @@ function App() {
       extension: '.xlsx',
       file: null,
       loading: Boolean(order.spreadsheet_path),
-      error: '',
       draft: false,
       selectedRows: [],
       selectedColumns: [],
@@ -1811,8 +2507,9 @@ function App() {
           }
         : current)
     } catch (error) {
+      setPageError(error.message)
       setLineupEditor((current) => current?.order.order_id === order.order_id
-        ? { ...current, loading: false, error: error.message }
+        ? { ...current, loading: false }
         : current)
     }
   }
@@ -1827,7 +2524,6 @@ function App() {
       extension: selectedFile?.name.toLowerCase().endsWith('.csv') ? '.csv' : '.xlsx',
       file: selectedFile,
       loading: Boolean(selectedFile),
-      error: '',
       draft: true,
       selectedRows: [],
       selectedColumns: [],
@@ -1841,8 +2537,9 @@ function App() {
         ? { ...current, ...table, loading: false }
         : current)
     } catch (error) {
+      setPageError(error.message)
       setLineupEditor((current) => current?.draft
-        ? { ...current, loading: false, error: error.message }
+        ? { ...current, loading: false }
         : current)
     }
   }
@@ -1854,7 +2551,7 @@ function App() {
   async function uploadLineupFromEditor() {
     if (lineupEditor?.draft) {
       if (!lineupEditor.file) {
-        updateLineupEditor({ error: 'Choose a CSV or XLSX spreadsheet first.' })
+        setPageError('Choose a CSV or XLSX spreadsheet first.')
         return
       }
       try {
@@ -1862,15 +2559,15 @@ function App() {
         formData.append('file', lineupEditor.file)
         const table = await api('/api/lineup/preview', { method: 'POST', body: formData })
         setLineupEditor((current) => current?.draft
-          ? { ...current, ...table, error: '', selectedRows: [], selectedColumns: [] }
+          ? { ...current, ...table, selectedRows: [], selectedColumns: [] }
           : current)
       } catch (error) {
-        updateLineupEditor({ error: error.message })
+        setPageError(error.message)
       }
       return
     }
     if (!lineupEditor?.file) {
-      updateLineupEditor({ error: 'Choose a CSV or XLSX spreadsheet first.' })
+      setPageError('Choose a CSV or XLSX spreadsheet first.')
       return
     }
     let table
@@ -1885,7 +2582,7 @@ function App() {
       uploadedOrder = uploadResult.order
       table = await api(`/api/orders/${lineupEditor.order.order_id}/lineup`)
     }, 'Lineup uploaded and total quantity calculated.')
-    if (succeeded) setLineupEditor((current) => current ? { ...current, ...table, order: uploadedOrder, file: null, error: '' } : current)
+    if (succeeded) setLineupEditor((current) => current ? { ...current, ...table, order: uploadedOrder, file: null } : current)
   }
 
   async function saveLineupEditor() {
@@ -1900,7 +2597,7 @@ function App() {
       setLineupFile(null)
       setLineupInputKey((key) => key + 1)
       setLineupEditor(null)
-      setNotice('Lineup edits saved and will be attached when the order is created.')
+      showNotice('Lineup edits saved and will be attached when the order is created.')
       return
     }
     let result
@@ -1915,7 +2612,7 @@ function App() {
         }),
       })
     }, 'Lineup spreadsheet updated.')
-    if (succeeded) setLineupEditor((current) => current ? { ...current, ...result, order: result.order, error: '' } : current)
+    if (succeeded) setLineupEditor((current) => current ? { ...current, ...result, order: result.order } : current)
   }
 
   async function createStaff(event) {
@@ -1990,17 +2687,18 @@ function App() {
     )
   }
 
-  async function addMachine(event, category) {
+  async function addMachine(event, category, businessUnit = null) {
     event.preventDefault()
-    const name = newMachineNames[category].trim()
+    const formKey = category === 'printing' ? `printing_${businessUnit}` : category
+    const name = newMachineNames[formKey].trim()
     if (!name) return
     await runAction(async () => {
       await api('/api/settings/machines', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ category, name }),
+        body: JSON.stringify({ category, name, business_unit: businessUnit }),
       })
-      setNewMachineNames((current) => ({ ...current, [category]: '' }))
+      setNewMachineNames((current) => ({ ...current, [formKey]: '' }))
     }, 'Machine added.')
   }
 
@@ -2010,7 +2708,10 @@ function App() {
       () => api(`/api/settings/machines/${machine.id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: editingMachineName }),
+        body: JSON.stringify({
+          name: editingMachineName,
+          business_unit: machine.category === 'printing' ? editingMachineBusinessUnit : null,
+        }),
       }),
       'Machine updated.',
     )
@@ -2033,6 +2734,7 @@ function App() {
     setFabricEntryForm(entry
       ? {
           fabric: entry.fabric,
+          fabric_width: entry.fabric_width ?? '',
           gsm: String(entry.gsm),
           roll_quantity: String(entry.roll_quantity),
           measurement_type: entry.measurement_type,
@@ -2088,32 +2790,86 @@ function App() {
     if (saved) closeFabricEntryModal()
   }
 
+  async function deleteFabricEntry(entry) {
+    if (!window.confirm(`Delete fabric record ${entry.fabric} · ${entry.fabric_width} · ${entry.gsm} GSM (${entry.total_meter} m)? This cannot be undone.`)) {
+      return
+    }
+    await runAction(
+      () => api(`/api/fabric-inventory/${entry.id}`, { method: 'DELETE' }),
+      'Fabric entry deleted.',
+    )
+  }
+
+  function editConsumableTransaction(entry) {
+    setConsumableForm({
+      business_unit: entry.business_unit,
+      consumable_code: entry.consumable_code,
+      transaction_type: entry.transaction_type,
+      quantity: String(entry.quantity),
+      entry_date: entry.entry_date,
+      note: entry.note || '',
+    })
+    setEditingConsumableTransactionId(entry.id)
+    setPageError('')
+  }
+
+  function cancelConsumableTransactionEdit() {
+    setEditingConsumableTransactionId(null)
+    setConsumableForm((current) => ({
+      ...current,
+      transaction_type: 'stock_in',
+      quantity: '',
+      entry_date: localDateInputValue(),
+      note: '',
+    }))
+  }
+
+  async function deleteConsumableTransaction(entry) {
+    if (!window.confirm(`Delete this ${entry.transaction_type.replace('_', ' ')} history entry for ${entry.consumable_label}? This changes the stock balance and cannot be undone.`)) {
+      return
+    }
+    const deleted = await runAction(
+      () => api(`/api/consumables/transactions/${entry.id}`, { method: 'DELETE' }),
+      'Consumable history entry deleted.',
+    )
+    if (deleted && editingConsumableTransactionId === entry.id) cancelConsumableTransactionEdit()
+  }
+
   async function saveConsumableTransaction(event) {
     event.preventDefault()
     const quantity = Number(consumableForm.quantity)
     if (!Number.isFinite(quantity) ||
       (consumableForm.transaction_type === 'stock_in' && quantity <= 0) ||
+      (consumableForm.transaction_type === 'usage' && quantity <= 0) ||
       (consumableForm.transaction_type === 'adjustment' && quantity === 0)) {
       setPageError('Enter a valid non-zero consumable quantity.')
       return
     }
     const saved = await runAction(
-      () => api('/api/consumables/transactions', {
-        method: 'POST',
+      () => api(editingConsumableTransactionId
+        ? `/api/consumables/transactions/${editingConsumableTransactionId}`
+        : '/api/consumables/transactions', {
+        method: editingConsumableTransactionId ? 'PUT' : 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...consumableForm, quantity }),
       }),
-      consumableForm.transaction_type === 'stock_in'
+      editingConsumableTransactionId
+        ? 'Consumable history entry updated.'
+        : consumableForm.transaction_type === 'stock_in'
         ? 'Consumable stock receipt recorded.'
         : 'Consumable stock adjusted.',
     )
     if (saved) {
-      setConsumableForm((current) => ({
-        ...current,
-        quantity: '',
-        entry_date: localDateInputValue(),
-        note: '',
-      }))
+      if (editingConsumableTransactionId) {
+        cancelConsumableTransactionEdit()
+      } else {
+        setConsumableForm((current) => ({
+          ...current,
+          quantity: '',
+          entry_date: localDateInputValue(),
+          note: '',
+        }))
+      }
     }
   }
 
@@ -2201,11 +2957,142 @@ function App() {
     }, approved ? 'Mock-up approved; order moved to sizing.' : 'Mock-up returned to the Artist.')
   }
 
+  function pasteUsageImage(event, order) {
+    const imageItem = [...event.clipboardData.items].find((item) =>
+      ['image/png', 'image/jpeg'].includes(item.type),
+    )
+    if (!imageItem) return
+    const image = imageItem.getAsFile()
+    if (!image) {
+      setPageError('The clipboard image could not be read. Copy it again and retry.')
+      return
+    }
+    event.preventDefault()
+    const extension = image.type === 'image/png' ? 'png' : 'jpg'
+    const file = new File([image], `usage-image-${order.order_id}.${extension}`, {
+      type: image.type,
+    })
+    extractUsageFromImage(order, file)
+  }
+
+  async function extractUsageFromImage(order, image = null) {
+    const form = stationForms[order.order_id] || {
+      consumable_process: order.business_unit || 'sublimation',
+      printer_brand: order.printer_machine || '',
+      consumable_brand: getPrinterStockBrand(order.printer_machine),
+      consumable_usage: {},
+    }
+    if (!image) {
+      setPageError('Choose a usage image before extracting quantities.')
+      return
+    }
+    const products = getStationConsumableProducts(form)
+    let worker
+    setPageError('')
+    setOcrStatusByOrder((current) => ({ ...current, [order.order_id]: 'Loading local OCR…' }))
+    try {
+      const { createWorker } = await import('tesseract.js')
+      worker = await createWorker('eng', 1, {
+        corePath: '/ocr/tesseract-core-lstm.wasm.js',
+        langPath: '/ocr',
+        workerPath: '/ocr/worker.min.js',
+        workerBlobURL: false,
+        gzip: true,
+        logger: ({ status, progress }) => {
+          setOcrStatusByOrder((current) => ({
+            ...current,
+            [order.order_id]: `${status}${Number.isFinite(progress) ? ` · ${Math.round(progress * 100)}%` : ''}`,
+          }))
+        },
+      })
+      const { canvas: ocrImage, labelCanvas } = await prepareUsageOcrImage(image)
+      const { data: standardData } = await worker.recognize(ocrImage, {}, { blocks: true, text: true })
+      const recognitionResults = [standardData]
+      const graphOcrResults = [standardData]
+      const extracted = findConsumptionImageValues(standardData, products)
+      if (Object.keys(extracted).length < products.length) {
+        await worker.setParameters({ tessedit_pageseg_mode: '11' })
+        const { data: sparseData } = await worker.recognize(ocrImage, {}, { blocks: true, text: true })
+        recognitionResults.push(sparseData)
+        graphOcrResults.push(sparseData)
+        const sparseValues = findConsumptionImageValues(sparseData, products)
+        for (const [code, value] of Object.entries(sparseValues)) {
+          if (!Object.hasOwn(extracted, code)) extracted[code] = value
+        }
+        await worker.setParameters({ tessedit_pageseg_mode: '6' })
+        const { data: labelData } = await worker.recognize(labelCanvas, {}, { blocks: true, text: true })
+        recognitionResults.push(labelData)
+        if (!labelData.text?.trim() && Object.keys(extracted).length === 0) {
+          throw new Error('No text was detected. Use a clearer image with numeric usage amounts.')
+        }
+        const labelValues = findConsumptionImageValues(labelData, products)
+        for (const [code, value] of Object.entries(labelValues)) {
+          if (!Object.hasOwn(extracted, code)) extracted[code] = value
+        }
+      }
+      const totalInkMilliliters = findTotalInkMilliliters(recognitionResults)
+      const graphEstimatedCodes = new Set()
+      if (totalInkMilliliters !== null) {
+        const graphValues = findGraphInkValues(
+          ocrImage,
+          graphOcrResults,
+          products.filter((product) => product.code.includes('_ink_')),
+          totalInkMilliliters,
+        )
+        for (const [code, value] of Object.entries(graphValues)) {
+          if (!Object.hasOwn(extracted, code)) {
+            extracted[code] = value
+            graphEstimatedCodes.add(code)
+          }
+        }
+      }
+      const extractedCount = Object.keys(extracted).length
+      if (extractedCount === 0) {
+        throw new Error('No labeled numeric usage amounts were found. For color graphs, include a readable total ink amount (for example, 15 ml). Enter actual consumption values manually otherwise.')
+      }
+      setStationForms((current) => ({
+        ...current,
+        [order.order_id]: {
+          ...(current[order.order_id] || form),
+          consumable_usage: {
+            ...(current[order.order_id]?.consumable_usage || form.consumable_usage || {}),
+            ...extracted,
+          },
+        },
+      }))
+      const detectedProducts = products
+        .filter((product) => Object.hasOwn(extracted, product.code))
+        .map((product) =>
+          `${product.label}: ${extracted[product.code]} ${product.unit}${
+            graphEstimatedCodes.has(product.code) ? ' (estimated from graph)' : ''
+          }`,
+        )
+      showNotice(`Read ${detectedProducts.join(', ')}. Review the populated fields before logging.`)
+    } catch (error) {
+      setPageError(`Unable to read the usage image: ${error.message}`)
+    } finally {
+      if (worker) {
+        try {
+          await worker.terminate()
+        } catch (error) {
+          setPageError((current) => current || `Unable to stop local OCR: ${error.message}`)
+        }
+      }
+      setOcrStatusByOrder((current) => {
+        const next = { ...current }
+        delete next[order.order_id]
+        return next
+      })
+    }
+  }
+
   async function stationAction(order, action) {
     await runAction(async () => {
       if (action === 'station-log') {
         const values = stationForms[order.order_id] || {}
+        const activeCodes = new Set(getStationConsumableProducts(values).map((product) => product.code))
         const consumableQuantities = Object.entries(values.consumable_usage || {})
+          .filter(([code]) => activeCodes.has(code))
         if (consumableQuantities.some(([, quantity]) =>
           quantity !== '' && (!Number.isFinite(Number(quantity)) || Number(quantity) < 0),
         )) {
@@ -2213,13 +3100,14 @@ function App() {
         }
         const consumables = consumableQuantities
           .filter(([, quantity]) => Number(quantity) > 0)
-          .map(([code, quantity]) => ({ code, quantity: Number(quantity) }))
+          .map(([code, quantity]) => ({ code, quantity: getInventoryQuantity(code, quantity) }))
         await api(`/api/orders/${order.order_id}/station-log`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             fabric_used: values.fabric_used || '',
             paper_meters: 0,
+            printer_brand: values.printer_brand || order.printer_machine || '',
             consumables,
             defect_description: values.defect_description || '',
           }),
@@ -2229,9 +3117,11 @@ function App() {
           [order.order_id]: {
             fabric_used: '',
             defect_description: '',
-            consumable_process: 'sublimation',
-            consumable_brand: 'atexco',
+            consumable_process: order.business_unit || 'sublimation',
+            printer_brand: values.printer_brand || order.printer_machine || '',
+            consumable_brand: getPrinterStockBrand(values.printer_brand || order.printer_machine),
             consumable_usage: {},
+
           },
         }))
         return
@@ -2305,11 +3195,17 @@ function App() {
 
   async function logReprintProduction(job) {
     const formKey = `reprint-${job.id}`
-    const values = stationForms[formKey] || {}
+    const values = stationForms[formKey] || {
+      consumable_process: job.business_unit || 'sublimation',
+      printer_brand: job.printer_machine || '',
+      consumable_brand: getPrinterStockBrand(job.printer_machine),
+      consumable_usage: {},
+    }
     await runAction(async () => {
+      const activeCodes = new Set(getStationConsumableProducts(values).map((product) => product.code))
       const consumables = Object.entries(values.consumable_usage || {})
-        .filter(([, quantity]) => Number(quantity) > 0)
-        .map(([code, quantity]) => ({ code, quantity: Number(quantity) }))
+        .filter(([code, quantity]) => activeCodes.has(code) && Number(quantity) > 0)
+        .map(([code, quantity]) => ({ code, quantity: getInventoryQuantity(code, quantity) }))
       if (Object.values(values.consumable_usage || {}).some((quantity) =>
         quantity !== '' && (!Number.isFinite(Number(quantity)) || Number(quantity) < 0),
       )) {
@@ -2321,6 +3217,7 @@ function App() {
         body: JSON.stringify({
           fabric_used: values.fabric_used || '',
           paper_meters: 0,
+          printer_brand: values.printer_brand || job.printer_machine || '',
           consumables,
           defect_description: values.defect_description || '',
         }),
@@ -2355,7 +3252,6 @@ function App() {
       orderId: order.order_id,
       activity: null,
       loading: true,
-      error: '',
     })
     try {
       const result = await api(`/api/orders/${encodeURIComponent(order.order_id)}/activity`)
@@ -2363,8 +3259,9 @@ function App() {
         ? { ...current, activity: result, loading: false }
         : current)
     } catch (error) {
+      setPageError(`Unable to load order consumption: ${error.message}`)
       setCompletedOrderDetails((current) => current?.orderId === order.order_id
-        ? { ...current, loading: false, error: error.message }
+        ? { ...current, loading: false }
         : current)
     }
   }
@@ -2379,7 +3276,13 @@ function App() {
 
   if (user?.must_change_password) {
     return (
-      <main className="flex min-h-screen items-center justify-center bg-slate-100 px-6 py-12 text-slate-900">
+      <main className="flex min-h-screen flex-col items-center justify-center gap-4 bg-slate-100 px-6 py-12 text-slate-900">
+        <div className="w-full max-w-3xl">
+          <NotificationBanner
+            notification={notification}
+            onDismiss={() => setNotification(null)}
+          />
+        </div>
         <section className="w-full max-w-md rounded-2xl bg-white p-8 shadow-lg ring-1 ring-slate-200">
           <p className="mb-3 text-sm font-semibold uppercase tracking-[0.2em] text-violet-600">B-POWER</p>
           <h1 className="text-3xl font-bold tracking-tight">Set your password</h1>
@@ -2396,7 +3299,6 @@ function App() {
                 value={newPassword}
               />
             </Field>
-            {loginError && <p className="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700" role="alert">{loginError}</p>}
             <IconButton className="w-full rounded-lg bg-violet-600 px-4 py-2.5 font-semibold text-white disabled:opacity-60" disabled={busy} type="submit">
               {busy ? 'Saving…' : 'Set password and continue'}
             </IconButton>
@@ -2408,26 +3310,34 @@ function App() {
 
   if (machineSelection && !machineSelection.complete) {
     const stationLabel = stationLabelByCategory[machineSelection.category]
+    const machineNotification = notification || (
+      machineSelection.error
+        ? { type: 'error', message: machineSelection.error }
+        : !machineSelection.loading && machineSelection.machines.length === 0
+          ? { type: 'warning', message: `No ${stationLabel.toLocaleLowerCase()} machines are configured. Contact an administrator to add one.` }
+          : null
+    )
     return (
-      <main className="flex min-h-screen items-center justify-center bg-slate-100 px-6 py-12 text-slate-900">
+      <main className="flex min-h-screen flex-col items-center justify-center gap-4 bg-slate-100 px-6 py-12 text-slate-900">
+        <div className="w-full max-w-3xl">
+          <NotificationBanner
+            notification={machineNotification}
+            onDismiss={() => {
+              if (notification) setNotification(null)
+              setMachineSelection((current) => current ? { ...current, error: '' } : current)
+            }}
+          />
+        </div>
         <section className="w-full max-w-md rounded-2xl bg-white p-8 shadow-lg ring-1 ring-slate-200">
           <p className="mb-3 text-sm font-semibold uppercase tracking-[0.2em] text-violet-600">B-POWER</p>
           <h1 className="text-2xl font-bold">{stationLabel} machine</h1>
           <p className="mt-2 text-sm text-slate-600">
             Select the machine you are using to continue to the {stationLabel} workspace.
           </p>
-          {machineSelection.error && (
-            <p className="mt-4 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700" role="alert">
-              {machineSelection.error}
-            </p>
-          )}
           {machineSelection.loading ? (
             <p className="mt-6 text-sm text-slate-500">Loading available machines…</p>
           ) : machineSelection.machines.length === 0 ? (
             <div className="mt-6 space-y-4">
-              <p className="rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-900">
-                No {stationLabel.toLocaleLowerCase()} machines are configured. Contact an administrator to add one.
-              </p>
               <IconButton
                 className="w-full rounded-lg border border-slate-300 px-4 py-2.5 text-sm font-semibold hover:bg-slate-50"
                 onClick={reloadMachineOptions}
@@ -2486,7 +3396,13 @@ function App() {
 
   if (!user) {
     return (
-      <main className="flex min-h-screen items-center justify-center bg-slate-100 px-6 py-12 text-slate-900">
+      <main className="flex min-h-screen flex-col items-center justify-center gap-4 bg-slate-100 px-6 py-12 text-slate-900">
+        <div className="w-full max-w-3xl">
+          <NotificationBanner
+            notification={notification}
+            onDismiss={() => setNotification(null)}
+          />
+        </div>
         <section className="w-full max-w-md rounded-2xl bg-white p-8 shadow-lg ring-1 ring-slate-200">
           <p className="mb-3 text-sm font-semibold uppercase tracking-[0.2em] text-violet-600">
             B-POWER SUBLIMATION MANAGEMENT
@@ -2518,11 +3434,6 @@ function App() {
                 value={password}
               />
             </Field>
-            {loginError && (
-              <p className="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700" role="alert">
-                {loginError}
-              </p>
-            )}
             <IconButton
               className="w-full rounded-lg bg-violet-600 px-4 py-2.5 font-semibold text-white hover:bg-violet-700 disabled:opacity-60"
               disabled={busy}
@@ -2536,10 +3447,17 @@ function App() {
     )
   }
 
-  const isSalesOrAdmin = ['admin', 'sales'].includes(user.role)
-  const isAdmin = user.role === 'admin'
+  const isSalesOrAdmin = ['admin', 'sales', 'supervisor'].includes(user.role)
+  const isAdmin = ['admin', 'supervisor'].includes(user.role)
   const isSupervisor = user.role === 'supervisor'
   const isBPowerSupervisor = isSupervisor && user.business_unit === 'sublimation'
+  const isDtfSupervisor = isSupervisor && user.business_unit === 'dtf'
+  const isSublimationPrintingOperator = user.role === 'print_operator' &&
+    machineSelection?.machines.some((machine) =>
+      machine.name === machineSelection.machineName && machine.business_unit === 'sublimation',
+    )
+  const canViewClients = isSalesOrAdmin
+  const canManageClientProfiles = isSalesOrAdmin
   const isArtist = user.role === 'artist'
   const isStationRole = Boolean(stationByRole[user.role])
   const stageNavigation = [
@@ -2568,9 +3486,20 @@ function App() {
       stageNavigation[8],
       { label: 'Reports', view: 'reports' },
     ],
-    supervisor: [
-      { label: 'Reports', view: 'reports' },
-    ],
+    supervisor: user.business_unit === 'dtf'
+      ? [
+          { label: 'Clients', view: 'clients' },
+          { label: 'Orders', view: 'all' },
+          stageNavigation[3],
+          stageNavigation[4],
+          stageNavigation[8],
+          { label: 'Reports', view: 'reports' },
+        ]
+      : [
+          { label: 'Orders', view: 'all' },
+          ...stageNavigation.slice(4),
+          { label: 'Reports', view: 'reports' },
+        ],
     artist: [
       stageNavigation[0],
       stageNavigation[2],
@@ -2578,13 +3507,16 @@ function App() {
     ],
     print_operator: [
       stageNavigation[3],
+      ...(isSublimationPrintingOperator ? [{ label: 'Reports', view: 'reports' }] : []),
     ],
     pressing_operator: [stageNavigation[4]],
     cutting_operator: [stageNavigation[5]],
     sewing_operator: [stageNavigation[6]],
     packing_operator: [stageNavigation[7]],
   }
-  const navigationItems = navigationByRole[user.role] || [
+  const navigationItems = (isSupervisor
+    ? navigationByRole.supervisor
+    : isAdmin ? navigationByRole.admin : navigationByRole[user.role]) || [
     { label: 'Orders', view: 'all' },
   ]
   const orderViews = new Set([
@@ -2597,11 +3529,13 @@ function App() {
   const isSalesApprovalQueue = activeView === 'sales_approval' && isSalesOrAdmin
   const isPrintingReprints = activeView === 'printing' && printingStage === 'reprints'
   const isPrintingTestPrints = activeView === 'printing' && printingStage === 'test_prints'
+  const canSetOrderPriority = isAdmin || user.role === 'sales'
+  const canCrudOrders = isSalesOrAdmin && !isBPowerSupervisor
   const reportNavigation = [
-    { view: 'overview', label: 'Overview', visible: isSalesOrAdmin },
-    { view: 'fabric', label: 'Fabric inventory', visible: isAdmin || isBPowerSupervisor },
-    { view: 'sublimation', label: 'Sublimation consumables', visible: isAdmin || user.business_unit === 'sublimation' },
-    { view: 'dtf', label: 'DTF consumables', visible: isAdmin || user.business_unit === 'dtf' },
+    { view: 'overview', label: 'Overview', visible: user.role === 'sales' || (isAdmin && !isDtfSupervisor) },
+    { view: 'fabric', label: 'Fabric inventory', visible: isAdmin && !isDtfSupervisor },
+    { view: 'sublimation', label: 'Sublimation consumables', visible: (isAdmin && !isSupervisor) || isSublimationPrintingOperator },
+    { view: 'dtf', label: 'DTF consumables', visible: isAdmin && (!isSupervisor || isDtfSupervisor) },
   ].filter((tab) => tab.visible)
   const canEditFabricInventory = isAdmin || user.role === 'pressing_operator' || isBPowerSupervisor
   const showingFabricInventory =
@@ -2749,6 +3683,32 @@ function App() {
             </div>
           </div>
         </header>
+        <section aria-label="Active order status" className="border-b border-amber-200 bg-amber-50">
+          <div className="mx-auto flex w-full flex-wrap items-center gap-3 px-4 py-2.5 sm:px-6 lg:px-8">
+            <h2 className="shrink-0 text-xs font-bold uppercase tracking-wide text-amber-950">Order status</h2>
+            {priorityOrders.length === 0 ? (
+              <p className="text-sm text-amber-900">No active orders.</p>
+            ) : (
+              <div className="flex min-w-0 flex-1 gap-2 overflow-x-auto pb-1">
+                {priorityOrders.map((order) => (
+                  <div className="flex shrink-0 items-center gap-2 rounded-lg border border-amber-200 bg-white px-3 py-2 text-sm" key={order.order_id}>
+                    <span className="rounded-full bg-violet-100 px-2 py-0.5 text-xs font-bold text-violet-800">
+                      {order.print_mode === 'print_only' ? 'Print only' : 'Print and press'}
+                    </span>
+                    <span className="max-w-56 truncate font-semibold" title={order.team_project_name}>
+                      {order.order_id} · {order.team_project_name}
+                    </span>
+                    <span className="text-xs text-slate-500">{stageLabels[order.order_status] || order.order_status}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </section>
+        <NotificationBanner
+          notification={notification}
+          onDismiss={() => setNotification(null)}
+        />
         <div className="border-b border-slate-200 bg-slate-100">
           <nav className="mx-auto flex w-full flex-nowrap gap-2 overflow-x-auto px-4 py-4 text-sm sm:px-6 lg:px-8" aria-label="Available modules">
             {navigationItems.map((module) => (
@@ -2760,7 +3720,10 @@ function App() {
                     : 'bg-white text-slate-700'
                 }`}
                 key={module.label}
-                onClick={() => setActiveView(module.view)}
+                onClick={() => {
+                  setActiveView(module.view)
+                  setReportDrilldown(null)
+                }}
                 type="button"
               >
                 <span aria-hidden="true" className="mr-2">
@@ -2813,29 +3776,23 @@ function App() {
               />
             </label>
           )}
+          {activeView === 'clients' && (
+            <label className="mx-auto block w-full bg-slate-100 px-4 pb-3 sm:px-6 lg:px-8">
+              <span className="sr-only">Search clients</span>
+              <input
+                aria-label="Search clients by client ID, company name, or contact person"
+                className={`${inputClass} mt-0 max-w-xl`}
+                onChange={(event) => setClientSearch(event.target.value)}
+                placeholder="Client ID, company name, or contact person"
+                type="search"
+                value={clientSearch}
+              />
+            </label>
+          )}
         </div>
       </div>
 
       <div className="mx-auto w-full px-4 py-8 sm:px-6 lg:px-8">
-        {(pageError || notice) && (
-          <div
-            className={`mb-5 rounded-lg px-4 py-3 text-sm ${pageError ? 'bg-red-50 text-red-700' : 'bg-emerald-50 text-emerald-800'}`}
-            role={pageError ? 'alert' : 'status'}
-          >
-            {pageError || notice}
-            <IconButton
-              className="float-right font-semibold"
-              onClick={() => {
-                setPageError('')
-                setNotice('')
-              }}
-              type="button"
-            >
-              Dismiss
-            </IconButton>
-          </div>
-        )}
-
         {activeView === 'reports' && (
           <nav aria-label="Reports sections" className="mb-6 flex flex-wrap gap-2">
             {reportNavigation.map((tab) => (
@@ -2849,6 +3806,7 @@ function App() {
                 key={tab.view}
                 onClick={() => {
                   setReportTab(tab.view)
+                  setReportDrilldown(null)
                   if (tab.view === 'dtf' || tab.view === 'sublimation') {
                     const businessUnit = tab.view
                     const firstProduct = consumableCatalog.find((product) => product.business_unit === businessUnit)
@@ -2867,7 +3825,71 @@ function App() {
           </nav>
         )}
 
-        {activeView === 'pressing' && ['admin', 'pressing_operator'].includes(user.role) && (
+        {activeView === 'all' && isSupervisor && !isAdmin && (
+          <section className="mb-8 rounded-xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
+            <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 className="text-lg font-bold">{user.business_unit === 'dtf' ? 'DTF' : 'Sublimation'} orders</h2>
+                <p className="mt-1 text-sm text-slate-500">
+                  {isDtfSupervisor
+                    ? 'DTF orders are scoped to your business unit. New orders start in Printing.'
+                    : 'Orders in your assigned business unit are available for read-only review.'}
+                </p>
+              </div>
+              {isDtfSupervisor && (
+                <IconButton
+                  className="rounded-lg bg-violet-600 px-4 py-2 text-sm font-semibold text-white"
+                  onClick={() => openSupervisorOrderForClient()}
+                  type="button"
+                >
+                  Create order
+                </IconButton>
+              )}
+            </div>
+            {orders.length === 0 ? (
+              <p className="rounded-lg bg-slate-50 p-4 text-sm text-slate-500">No orders are available for this business unit.</p>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[800px] text-left text-sm">
+                  <thead className="bg-slate-50 text-xs uppercase text-slate-500">
+                    <tr>
+                      <th className="px-3 py-2">Order</th>
+                      <th className="px-3 py-2">Client</th>
+                      <th className="px-3 py-2">Project / item</th>
+                      <th className="px-3 py-2">Print mode</th>
+                      <th className="px-3 py-2">Due date</th>
+                      <th className="px-3 py-2">Stage</th>
+                      <th className="px-3 py-2">Details</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {orders.map((order) => (
+                      <tr className="border-t border-slate-100" key={order.order_id}>
+                        <td className="px-3 py-2 font-medium">{order.order_id}</td>
+                        <td className="px-3 py-2">{order.client_company_name || order.client_id}</td>
+                        <td className="px-3 py-2">{order.team_project_name} · {order.item}</td>
+                        <td className="px-3 py-2">{order.print_mode === 'print_only' ? 'Print only' : 'Print and press'}</td>
+                        <td className="px-3 py-2">{order.due_date}</td>
+                        <td className="px-3 py-2">{stageLabels[order.order_status] || order.order_status}</td>
+                        <td className="px-3 py-2">
+                          <IconButton
+                            className="rounded border border-slate-300 px-2 py-1 text-xs font-medium"
+                            onClick={() => openCompletedOrderDetails(order)}
+                            type="button"
+                          >
+                            Order details
+                          </IconButton>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
+        )}
+
+        {activeView === 'pressing' && (isAdmin || user.role === 'pressing_operator') && (
           <nav aria-label="Pressing processes" className="mb-6 flex flex-wrap gap-2">
             {[
               ['orders', 'Order processing'],
@@ -2903,7 +3925,7 @@ function App() {
                 { key: 'defects', label: 'Recorded defects', value: report.defects || 0, type: 'summary-consumption' },
               ].map((card, index) => (
                 <button
-                  aria-expanded={reportDrilldown?.type === card.type && reportDrilldown.key === card.key}
+                  aria-haspopup="dialog"
                   aria-label={`Show details for ${card.label}: ${card.value}`}
                   className={`report-summary-card rounded-xl bg-white p-4 text-left shadow-sm ring-1 ring-slate-200 ${
                     reportDrilldown?.type === card.type && reportDrilldown.key === card.key
@@ -2911,7 +3933,7 @@ function App() {
                       : ''
                   }`}
                   key={card.key}
-                  onClick={() => setReportDrilldown((current) =>
+                  onDoubleClick={() => setReportDrilldown((current) =>
                     current?.type === card.type && current.key === card.key
                       ? null
                       : { type: card.type, key: card.key },
@@ -2921,7 +3943,7 @@ function App() {
                 >
                   <span className="block text-sm text-slate-500">{card.label}</span>
                   <span className="mt-1 block text-2xl font-bold">{card.value}</span>
-                  <span className="mt-2 block text-xs text-violet-700">Click to view details</span>
+                  <span className="mt-2 block text-xs text-violet-700">Double-click to view details</span>
                 </button>
               ))}
             </div>
@@ -2952,7 +3974,7 @@ function App() {
                         >
                           <td className="px-3 py-2">
                             <button
-                              aria-expanded={reportDrilldown?.type === 'stage' && reportDrilldown.key === stage.order_status}
+                              aria-haspopup="dialog"
                               className="font-medium text-violet-700 underline decoration-dotted underline-offset-2 hover:text-violet-900 focus-visible:outline focus-visible:outline-2 focus-visible:outline-violet-600"
                               onClick={() => setReportDrilldown((current) =>
                                 current?.type === 'stage' && current.key === stage.order_status
@@ -2998,7 +4020,7 @@ function App() {
                       >
                         <td className="px-3 py-2">
                           <button
-                            aria-expanded={reportDrilldown?.type === 'consumption' && reportDrilldown.key === entry.station}
+                            aria-haspopup="dialog"
                             className="font-medium text-violet-700 underline decoration-dotted underline-offset-2 hover:text-violet-900 focus-visible:outline focus-visible:outline-2 focus-visible:outline-violet-600"
                             onClick={() => setReportDrilldown((current) =>
                               current?.type === 'consumption' && current.key === entry.station
@@ -3024,7 +4046,18 @@ function App() {
               </section>
             </div>
             {reportDrilldown && (
-              <section className="report-drilldown mt-5 overflow-hidden rounded-xl border border-violet-200 bg-white p-4 shadow-sm">
+              <div
+                className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/60 p-3 sm:p-6"
+                onMouseDown={(event) => {
+                  if (event.target === event.currentTarget) setReportDrilldown(null)
+                }}
+              >
+                <section
+                  aria-labelledby="report-drilldown-title"
+                  aria-modal="true"
+                  className="max-h-[92vh] w-full max-w-6xl overflow-y-auto rounded-xl bg-white p-4 shadow-2xl sm:p-6"
+                  role="dialog"
+                >
                 {reportDrilldown.type === 'stage' || reportDrilldown.type === 'summary-orders' ? (() => {
                   const summaryOrderFilters = {
                     active: (order) => !['complete', 'pickup_delivered'].includes(order.order_status),
@@ -3046,7 +4079,7 @@ function App() {
                   return (
                     <>
                       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-                        <h3 className="font-bold">{title}</h3>
+                        <h3 className="font-bold" id="report-drilldown-title">{title}</h3>
                         <button
                           className="text-sm font-medium text-violet-700 hover:text-violet-900"
                           onClick={() => setReportDrilldown(null)}
@@ -3067,18 +4100,39 @@ function App() {
                                 <th className="px-3 py-2">Project</th>
                                 <th className="px-3 py-2">Quantity</th>
                                 <th className="px-3 py-2">Due date</th>
+                                <th className="px-3 py-2">Priority</th>
                               </tr>
                             </thead>
                             <tbody>
-                              {stageOrders.map((order) => (
-                                <tr className="border-t border-slate-100" key={order.order_id}>
-                                  <td className="px-3 py-2 font-semibold">{order.order_id}</td>
-                                  <td className="px-3 py-2">{order.client_company_name || order.client_id}</td>
-                                  <td className="px-3 py-2">{order.team_project_name}</td>
-                                  <td className="px-3 py-2">{order.total_quantity}</td>
-                                  <td className="px-3 py-2">{order.due_date}</td>
-                                </tr>
-                              ))}
+                              {stageOrders.map((order) => {
+                                const priority = priorityOrders.find((entry) => entry.order_id === order.order_id)?.order_priority ||
+                                  order.order_priority ||
+                                  'Normal'
+                                return (
+                                  <tr className="border-t border-slate-100" key={order.order_id}>
+                                    <td className="px-3 py-2 font-semibold">{order.order_id}</td>
+                                    <td className="px-3 py-2">{order.client_company_name || order.client_id}</td>
+                                    <td className="px-3 py-2">{order.team_project_name}</td>
+                                    <td className="px-3 py-2">{order.total_quantity}</td>
+                                    <td className="px-3 py-2">{order.due_date}</td>
+                                    <td className="px-3 py-2">
+                                      {canSetOrderPriority && !['complete', 'pickup_delivered'].includes(order.order_status) ? (
+                                        <select
+                                          aria-label={`Set priority for ${order.order_id}`}
+                                          className="rounded border border-slate-300 px-2 py-1 text-xs"
+                                          disabled={busy}
+                                          onChange={(event) => updateOrderPriority(order, event.target.value)}
+                                          value={priority}
+                                        >
+                                          {orderPriorities.map((value) => (
+                                            <option key={value} value={value}>{value}</option>
+                                          ))}
+                                        </select>
+                                      ) : priority}
+                                    </td>
+                                  </tr>
+                                )
+                              })}
                             </tbody>
                           </table>
                         </div>
@@ -3103,7 +4157,7 @@ function App() {
                   return (
                     <>
                       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-                        <h3 className="font-bold">{title}</h3>
+                        <h3 className="font-bold" id="report-drilldown-title">{title}</h3>
                         <button
                           className="text-sm font-medium text-violet-700 hover:text-violet-900"
                           onClick={() => setReportDrilldown(null)}
@@ -3148,7 +4202,8 @@ function App() {
                     </>
                   )
                 })()}
-              </section>
+                </section>
+              </div>
             )}
           </section>
         )}
@@ -3163,25 +4218,33 @@ function App() {
                 Stock on hand is calculated from receipts, adjustments, and usage recorded on Printing production logs.
               </p>
             </div>
-            {['admin', 'supervisor'].includes(user.role) && (
+            {isAdmin && (
               <form className="mb-6 grid gap-3 rounded-lg bg-slate-50 p-4 md:grid-cols-3" onSubmit={saveConsumableTransaction}>
                 <Field label="Transaction">
                   <select
                     className={inputClass}
                     onChange={(event) => setConsumableForm((current) => ({ ...current, transaction_type: event.target.value }))}
+                    disabled={Boolean(editingConsumableTransactionId)}
                     value={consumableForm.transaction_type}
                   >
                     <option value="stock_in">Receive stock</option>
                     <option value="adjustment">Adjust stock</option>
+                    {editingConsumableTransactionId && <option value="usage">Usage</option>}
                   </select>
                 </Field>
                 <Field label="Consumable">
                   <select
                     className={inputClass}
                     onChange={(event) => setConsumableForm((current) => ({ ...current, consumable_code: event.target.value }))}
+                    disabled={Boolean(editingConsumableTransactionId)}
                     required
                     value={consumableForm.consumable_code}
                   >
+                    {!activeConsumableOptions.some((product) => product.code === consumableForm.consumable_code) && (
+                      <option value={consumableForm.consumable_code}>
+                        {consumablesReport.transactions.find((entry) => entry.consumable_code === consumableForm.consumable_code)?.consumable_label || consumableForm.consumable_code}
+                      </option>
+                    )}
                     {activeConsumableOptions.map((product) => (
                       <option key={product.code} value={product.code}>{product.label}</option>
                     ))}
@@ -3190,7 +4253,7 @@ function App() {
                 <Field label={`Quantity (${consumableCatalog.find((product) => product.code === consumableForm.consumable_code)?.unit || ''})`}>
                   <input
                     className={inputClass}
-                    min={consumableForm.transaction_type === 'stock_in' ? '0.001' : undefined}
+                    min={['stock_in', 'usage'].includes(consumableForm.transaction_type) ? '0.001' : undefined}
                     onChange={(event) => setConsumableForm((current) => ({ ...current, quantity: event.target.value }))}
                     placeholder={consumableForm.transaction_type === 'adjustment' ? 'Use a negative value to reduce stock' : ''}
                     required
@@ -3221,8 +4284,19 @@ function App() {
                   disabled={busy}
                   type="submit"
                 >
-                  {consumableForm.transaction_type === 'stock_in' ? 'Record receipt' : 'Save adjustment'}
+                  {editingConsumableTransactionId
+                    ? 'Save changes'
+                    : consumableForm.transaction_type === 'stock_in' ? 'Record receipt' : 'Save adjustment'}
                 </IconButton>
+                {editingConsumableTransactionId && (
+                  <IconButton
+                    className="self-end rounded-lg border border-slate-300 px-4 py-2 text-sm font-semibold"
+                    onClick={cancelConsumableTransactionEdit}
+                    type="button"
+                  >
+                    Cancel edit
+                  </IconButton>
+                )}
               </form>
             )}
             <div className="overflow-x-auto rounded-lg border border-slate-200">
@@ -3261,6 +4335,7 @@ function App() {
                     <th className="px-3 py-2">Order</th>
                     <th className="px-3 py-2">Recorded by</th>
                     <th className="px-3 py-2">Note</th>
+                    {isAdmin && <th className="px-3 py-2">Actions</th>}
                   </tr>
                 </thead>
                 <tbody>
@@ -3276,10 +4351,32 @@ function App() {
                       <td className="px-3 py-2">{entry.order_id || '—'}</td>
                       <td className="px-3 py-2">{entry.recorded_by}</td>
                       <td className="px-3 py-2">{entry.note || '—'}</td>
+                      {isAdmin && (
+                        <td className="px-3 py-2">
+                          <div className="flex gap-2">
+                            <IconButton
+                              className="rounded border border-violet-300 px-2 py-1 text-xs font-medium text-violet-800 hover:bg-violet-50"
+                              disabled={busy}
+                              onClick={() => editConsumableTransaction(entry)}
+                              type="button"
+                            >
+                              Edit
+                            </IconButton>
+                            <IconButton
+                              className="rounded border border-red-300 px-2 py-1 text-xs font-medium text-red-700 hover:bg-red-50"
+                              disabled={busy}
+                              onClick={() => deleteConsumableTransaction(entry)}
+                              type="button"
+                            >
+                              Delete
+                            </IconButton>
+                          </div>
+                        </td>
+                      )}
                     </tr>
                   ))}
                   {visibleConsumableTransactions.length === 0 && (
-                    <tr><td className="px-3 py-3 text-slate-500" colSpan="7">No stock or usage transactions recorded.</td></tr>
+                    <tr><td className="px-3 py-3 text-slate-500" colSpan={isAdmin ? 8 : 7}>No stock or usage transactions recorded.</td></tr>
                   )}
                 </tbody>
               </table>
@@ -3287,22 +4384,26 @@ function App() {
           </section>
         )}
 
-        {activeView === 'clients' && isSalesOrAdmin && (
+        {activeView === 'clients' && canViewClients && (
           <section className="mb-8 scroll-mt-48 rounded-xl bg-white p-5 shadow-sm ring-1 ring-slate-200" id="clients">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <h2 className="text-lg font-bold">Client profiles</h2>
-                <p className="mt-1 text-sm text-slate-500">Manage your clients and their contact details.</p>
+                <p className="mt-1 text-sm text-slate-500">
+                  {isAdmin ? 'Manage client profiles and create orders.' : 'Manage your clients and their contact details.'}
+                </p>
               </div>
-              <IconButton
-                className="rounded-lg bg-violet-600 px-4 py-2 text-sm font-semibold text-white hover:bg-violet-700"
-                onClick={() => setIsClientModalOpen(true)}
-                type="button"
-              >
-                New client
-              </IconButton>
+              {canManageClientProfiles && (
+                <IconButton
+                  className="rounded-lg bg-violet-600 px-4 py-2 text-sm font-semibold text-white hover:bg-violet-700"
+                  onClick={() => setIsClientModalOpen(true)}
+                  type="button"
+                >
+                  New client
+                </IconButton>
+              )}
             </div>
-            {editingClientId && (
+            {editingClientId && canManageClientProfiles && (
               <form className="mt-6 rounded-lg border border-violet-200 bg-violet-50 p-4" onSubmit={updateClient}>
                 <h3 className="font-semibold">Edit client profile</h3>
                 <div className="mt-3 grid gap-3 md:grid-cols-2">
@@ -3340,17 +4441,6 @@ function App() {
                 </div>
               </form>
             )}
-            <label className="mt-5 block max-w-xl text-sm font-medium text-slate-700">
-              Search clients
-              <input
-                aria-label="Search clients by client ID, company name, or contact person"
-                className={inputClass}
-                onChange={(event) => setClientSearch(event.target.value)}
-                placeholder="Client ID, company name, or contact person"
-                type="search"
-                value={clientSearch}
-              />
-            </label>
             <div className="mt-4 overflow-x-auto rounded-lg ring-1 ring-slate-200">
               <table className={`w-full ${isAdmin ? 'min-w-[900px]' : 'min-w-[760px]'} text-left text-sm`}>
                 <thead className="bg-slate-50 text-xs uppercase text-slate-500">
@@ -3359,7 +4449,9 @@ function App() {
                 <tbody>
                   {visibleClients.length === 0 ? (
                     <tr><td className="px-3 py-4 text-slate-500" colSpan={isAdmin ? 7 : 6}>
-                      {clients.length === 0 ? 'No client profiles yet.' : 'No clients match your search.'}
+                      {clients.length === 0
+                        ? 'No client profiles yet.'
+                        : 'No clients match your search.'}
                     </td></tr>
                   ) : visibleClients.map((client) => (
                     <tr className="border-t border-slate-100 align-top" key={client.client_id}>
@@ -3456,7 +4548,179 @@ function App() {
           </div>
         )}
 
-        {activeView === 'clients' && isSalesOrAdmin && isOrderModalOpen && (
+        {activeView === 'clients' && isAdmin && isAdminOrderSetupOpen && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-slate-950/50 p-4"
+            onClick={(event) => {
+              if (event.target === event.currentTarget) closeOrderModal()
+            }}
+          >
+            <section
+              aria-labelledby="admin-order-setup-title"
+              aria-modal="true"
+              className="my-auto w-full max-w-xl rounded-xl bg-white p-5 shadow-2xl sm:p-7"
+              role="dialog"
+            >
+              <div className="mb-5">
+                <h2 className="text-xl font-bold" id="admin-order-setup-title">Choose order process</h2>
+                <p className="mt-1 text-sm text-slate-500">Client: {orderModalClient?.company_name}</p>
+              </div>
+              <div className="grid gap-4">
+                <Field label="Printing process">
+                  {isDtfSupervisor ? (
+                    <input className={inputClass} readOnly value="DTF" />
+                  ) : (
+                    <select
+                      className={inputClass}
+                      onChange={(event) => setAdminOrderSetup((current) => ({
+                        business_unit: event.target.value,
+                        order_type: ['full_subli', 'dtf'].includes(current.order_type)
+                          ? event.target.value === 'dtf' ? 'dtf' : 'full_subli'
+                          : current.order_type,
+                      }))}
+                      value={adminOrderSetup.business_unit}
+                    >
+                      <option value="dtf">DTF</option>
+                      <option value="sublimation">Sublimation</option>
+                    </select>
+                  )}
+                </Field>
+                <fieldset className="grid gap-2">
+                  <legend className="mb-1 text-sm font-medium text-slate-700">Order type</legend>
+                  {(isDtfSupervisor
+                    ? [
+                        { value: 'print_only', label: 'Print only', description: 'Starts in Printing and completes without pressing.' },
+                        { value: 'print_press', label: 'Print and Press', description: 'Starts in Printing and then advances to Pressing.' },
+                        {
+                          value: 'dtf',
+                          label: 'DTF',
+                          description: 'Create a DTF order that starts in Printing.',
+                        },
+                      ]
+                    : [
+                    { value: 'print_only', label: 'Print only', description: 'Starts in Printing and completes without pressing.' },
+                    { value: 'print_press', label: 'Print and press', description: 'Starts in Printing and then advances to Pressing.' },
+                    {
+                      value: adminOrderSetup.business_unit === 'dtf' ? 'dtf' : 'full_subli',
+                      label: adminOrderSetup.business_unit === 'dtf' ? 'DTF' : 'Full subli',
+                      description: adminOrderSetup.business_unit === 'dtf'
+                        ? 'Create a DTF order that starts in Printing.'
+                        : 'Use the full sublimation order and production workflow.',
+                    },
+                  ]).map((option) => (
+                    <label
+                      className={`flex cursor-pointer gap-3 rounded-lg border p-3 ${
+                        adminOrderSetup.order_type === option.value
+                          ? 'border-violet-500 bg-violet-50'
+                          : 'border-slate-200'
+                      } ${option.disabled ? 'cursor-not-allowed opacity-50' : ''}`}
+                      key={option.value}
+                    >
+                      <input
+                        checked={adminOrderSetup.order_type === option.value}
+                        className="mt-1"
+                        disabled={option.disabled}
+                        name="admin-order-type"
+                        onChange={() => setAdminOrderSetup((current) => ({
+                          ...current,
+                          order_type: option.value,
+                        }))}
+                        type="radio"
+                        value={option.value}
+                      />
+                      <span>
+                        <span className="block text-sm font-semibold text-slate-800">{option.label}</span>
+                        <span className="mt-0.5 block text-xs text-slate-500">{option.description}</span>
+                      </span>
+                    </label>
+                  ))}
+                </fieldset>
+                <div className="flex justify-end gap-2">
+                  <IconButton
+                    className="rounded-lg border border-slate-300 px-4 py-2 text-sm font-medium"
+                    onClick={closeOrderModal}
+                    type="button"
+                  >
+                    Cancel
+                  </IconButton>
+                  <IconButton
+                    className="rounded-lg bg-violet-600 px-5 py-2 text-sm font-semibold text-white hover:bg-violet-700"
+                    onClick={continueAdminOrderSetup}
+                    type="button"
+                  >
+                    Continue
+                  </IconButton>
+                </div>
+              </div>
+            </section>
+          </div>
+        )}
+
+        {activeView === 'clients' && isAdmin && isAdminDirectOrderModalOpen && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-slate-950/50 p-4"
+            onClick={(event) => {
+              if (event.target === event.currentTarget) closeOrderModal()
+            }}
+          >
+            <section
+              aria-labelledby="admin-direct-order-title"
+              aria-modal="true"
+              className="my-auto w-full max-w-3xl rounded-xl bg-white p-5 shadow-2xl sm:p-7"
+              role="dialog"
+            >
+              <div className="mb-5">
+                <h2 className="text-xl font-bold" id="admin-direct-order-title">
+                  Create {supervisorOrderForm.business_unit === 'dtf' ? 'DTF' : 'Sublimation'} · {
+                    supervisorOrderForm.print_mode === 'print_only' ? 'Print only' : 'Print and press'
+                  } order
+                </h2>
+                <p className="mt-1 text-sm text-slate-500">
+                  Client: {orderModalClient?.company_name} · This order starts in Printing.
+                </p>
+              </div>
+              <form className="grid gap-3 md:grid-cols-2" onSubmit={createSupervisorOrder}>
+                <Field label="Name">
+                  <input className={inputClass} onChange={(event) => setSupervisorOrderForm((current) => ({ ...current, team_project_name: event.target.value }))} required value={supervisorOrderForm.team_project_name} />
+                </Field>
+                <Field label="Date">
+                  <input className={inputClass} onChange={(event) => setSupervisorOrderForm((current) => ({ ...current, due_date: event.target.value }))} required type="date" value={supervisorOrderForm.due_date} />
+                </Field>
+                <Field label="Qty. of files to be printed">
+                  <input className={inputClass} min="1" onChange={(event) => setSupervisorOrderForm((current) => ({ ...current, total_quantity: event.target.value }))} required type="number" value={supervisorOrderForm.total_quantity} />
+                </Field>
+                <Field label="Print mode">
+                  <input className={inputClass} readOnly value={supervisorOrderForm.print_mode === 'print_only' ? 'Print only' : 'Print and press'} />
+                </Field>
+                <Field label="Printer brand">
+                  <select className={inputClass} onChange={(event) => setSupervisorOrderForm((current) => ({ ...current, printer_machine: event.target.value }))} required value={supervisorOrderForm.printer_machine}>
+                    <option value="">Select printer brand</option>
+                    {machines.filter((machine) => machine.category === 'printing' &&
+                      (machine.business_unit === null || machine.business_unit === supervisorOrderForm.business_unit)).map((machine) => (
+                      <option key={machine.id} value={machine.name}>{machine.name}</option>
+                    ))}
+                  </select>
+                </Field>
+                {supervisorOrderForm.print_mode === 'print_press' && (
+                  <Field label="Pressing machine">
+                    <select className={inputClass} onChange={(event) => setSupervisorOrderForm((current) => ({ ...current, pressing_machine: event.target.value }))} required value={supervisorOrderForm.pressing_machine}>
+                      <option value="">Select pressing machine</option>
+                      {machines.filter((machine) => machine.category === 'pressing').map((machine) => (
+                        <option key={machine.id} value={machine.name}>{machine.name}</option>
+                      ))}
+                    </select>
+                  </Field>
+                )}
+                <div className="flex justify-end gap-2 md:col-span-2">
+                  <IconButton className="rounded-lg border border-slate-300 px-4 py-2 text-sm font-medium" onClick={closeOrderModal} type="button">Cancel</IconButton>
+                  <IconButton className="rounded-lg bg-violet-600 px-5 py-2 text-sm font-semibold text-white disabled:opacity-60" disabled={busy} type="submit">Create order</IconButton>
+                </div>
+              </form>
+            </section>
+          </div>
+        )}
+
+        {(isAdmin && !isBPowerSupervisor || user.role === 'sales') && isOrderModalOpen && (
           <div
             className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-slate-950/50 p-4"
             onClick={(event) => {
@@ -3471,9 +4735,16 @@ function App() {
             >
               <div className="mb-5 flex items-start justify-between gap-4">
                 <div>
-                  <h2 className="text-xl font-bold" id="client-order-title">Create production order</h2>
+                  <h2 className="text-xl font-bold" id="client-order-title">
+                    {isAdmin && adminOrderSetup.order_type === 'full_subli'
+                      ? 'Create full sublimation order'
+                      : 'Create production order'}
+                  </h2>
                   <p className="mt-1 text-sm text-slate-500">
-                    Client: {orderModalClient?.company_name} · Orders saved before the layout fee is paid remain out of the Artist mock-up queue. Down payment applies to sizing. Upload the lineup to calculate quantity.
+                    {orderModalClient
+                      ? `Client: ${orderModalClient.company_name} · `
+                      : 'Select a client below. '}
+                    Orders saved before the layout fee is paid remain out of the Artist mock-up queue. Down payment applies to sizing. Upload the lineup to calculate quantity.
                   </p>
                 </div>
                 <IconButton
@@ -3485,11 +4756,6 @@ function App() {
                   Close
                 </IconButton>
               </div>
-              {pageError && (
-                <p className="mb-4 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700" role="alert">
-                  {pageError}
-                </p>
-              )}
               <OrderEntryForm
                 busy={busy}
                 clients={clients}
@@ -3497,6 +4763,7 @@ function App() {
                 isSalesOrAdmin={isSalesOrAdmin}
                 machines={machines}
                 styleNumberOptions={styleNumberOptions}
+                fabricOptions={fabricOptions}
                 lineupInputKey={lineupInputKey}
                 onOpenLineup={openDraftLineupEditor}
                 lineupDraft={lineupDraft}
@@ -3513,45 +4780,218 @@ function App() {
           </div>
         )}
 
+        {isSupervisor && isSupervisorOrderModalOpen && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-slate-950/50 p-4"
+            onClick={(event) => {
+              if (event.target === event.currentTarget) setIsSupervisorOrderModalOpen(false)
+            }}
+          >
+            <section
+              aria-labelledby="supervisor-order-title"
+              aria-modal="true"
+              className="my-auto w-full max-w-3xl rounded-xl bg-white p-5 shadow-2xl sm:p-7"
+              role="dialog"
+            >
+              <div className="mb-5 flex items-start justify-between gap-4">
+                <div>
+                  <h2 className="text-xl font-bold" id="supervisor-order-title">Create {user.business_unit === 'dtf' ? 'DTF' : 'Sublimation'} order</h2>
+                  <p className="mt-1 text-sm text-slate-500">The selected client profile is linked to the order, which starts in Printing.</p>
+                </div>
+                <IconButton
+                  aria-label="Close create order dialog"
+                  className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-medium"
+                  onClick={() => setIsSupervisorOrderModalOpen(false)}
+                  type="button"
+                >
+                  Close
+                </IconButton>
+              </div>
+              <form className="grid gap-3 md:grid-cols-2" onSubmit={createSupervisorOrder}>
+                <Field label="Client">
+                  <select
+                    className={inputClass}
+                    onChange={(event) => setSupervisorOrderForm((current) => ({ ...current, client_id: event.target.value }))}
+                    required
+                    value={supervisorOrderForm.client_id}
+                  >
+                    <option value="">Select a client</option>
+                    {clients.map((client) => (
+                      <option key={client.client_id} value={client.client_id}>{client.company_name} · {client.contact_person} · {client.contact_number}</option>
+                    ))}
+                  </select>
+                </Field>
+                <Field label="Name">
+                  <input className={inputClass} onChange={(event) => setSupervisorOrderForm((current) => ({ ...current, team_project_name: event.target.value }))} required value={supervisorOrderForm.team_project_name} />
+                </Field>
+                <Field label="Date">
+                  <input className={inputClass} onChange={(event) => setSupervisorOrderForm((current) => ({ ...current, due_date: event.target.value }))} required type="date" value={supervisorOrderForm.due_date} />
+                </Field>
+                <Field label="Qty. of files to be printed">
+                  <input className={inputClass} min="1" onChange={(event) => setSupervisorOrderForm((current) => ({ ...current, total_quantity: event.target.value }))} required type="number" value={supervisorOrderForm.total_quantity} />
+                </Field>
+                <Field label="Print mode">
+                  <select className={inputClass} onChange={(event) => setSupervisorOrderForm((current) => ({ ...current, print_mode: event.target.value, pressing_machine: '' }))} required value={supervisorOrderForm.print_mode}>
+                    <option value="print_only">Print only</option>
+                    <option value="print_press">Print and press</option>
+                  </select>
+                </Field>
+                <Field label="Printer brand">
+                  <select className={inputClass} onChange={(event) => setSupervisorOrderForm((current) => ({ ...current, printer_machine: event.target.value }))} required value={supervisorOrderForm.printer_machine}>
+                    <option value="">Select printer brand</option>
+                    {machines.filter((machine) => machine.category === 'printing' &&
+                      (machine.business_unit === null || machine.business_unit === supervisorOrderForm.business_unit)).map((machine) => (
+                      <option key={machine.id} value={machine.name}>{machine.name}</option>
+                    ))}
+                  </select>
+                </Field>
+                {supervisorOrderForm.print_mode === 'print_press' && (
+                  <Field label="Pressing machine">
+                    <select className={inputClass} onChange={(event) => setSupervisorOrderForm((current) => ({ ...current, pressing_machine: event.target.value }))} required value={supervisorOrderForm.pressing_machine}>
+                      <option value="">Select pressing machine</option>
+                      {machines.filter((machine) => machine.category === 'pressing').map((machine) => (
+                        <option key={machine.id} value={machine.name}>{machine.name}</option>
+                      ))}
+                    </select>
+                  </Field>
+                )}
+                <div className="flex justify-end gap-2 md:col-span-2">
+                  <IconButton className="rounded-lg border border-slate-300 px-4 py-2 text-sm font-medium" onClick={() => setIsSupervisorOrderModalOpen(false)} type="button">Cancel</IconButton>
+                  <IconButton className="rounded-lg bg-violet-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-60" disabled={busy || clients.length === 0} type="submit">
+                    {clients.length === 0 ? 'Add a client before creating an order' : 'Create order'}
+                  </IconButton>
+                </div>
+              </form>
+            </section>
+          </div>
+        )}
+
+        {activeView === 'settings' && isAdmin && (
+          <section className="mb-8 rounded-xl bg-white p-5 shadow-sm ring-1 ring-slate-200" id="database-backup">
+            <h2 className="text-lg font-bold">Database import / export</h2>
+            <p className="mt-1 text-sm text-slate-500">Backup and restore the SQLite database. Uploaded images and documents are stored separately and are not included.</p>
+            <div className="mt-5 grid gap-5 lg:grid-cols-2">
+              <form className="rounded-lg border border-slate-200 p-4" onSubmit={exportDatabase}>
+                <h3 className="font-semibold">Export database</h3>
+                <Field label="Required file name">
+                  <input
+                    className={inputClass}
+                    onChange={(event) => setDatabaseForm((current) => ({ ...current, export_file_name: event.target.value }))}
+                    placeholder="bpsms-backup"
+                    required
+                    value={databaseForm.export_file_name}
+                  />
+                </Field>
+                <p className="mt-2 text-xs text-slate-500">A .db extension will be added automatically.</p>
+                <IconButton className="mt-4 rounded-lg bg-violet-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-60" disabled={busy} type="submit">Export .db file</IconButton>
+              </form>
+              <form className="rounded-lg border border-slate-200 p-4" onSubmit={importDatabase}>
+                <h3 className="font-semibold">Import database</h3>
+                <Field label="Required file name">
+                  <input
+                    className={inputClass}
+                    onChange={(event) => setDatabaseForm((current) => ({ ...current, import_file_name: event.target.value }))}
+                    placeholder="database-backup"
+                    required
+                    value={databaseForm.import_file_name}
+                  />
+                </Field>
+                <Field label="SQLite database file">
+                  <input
+                    accept=".db,application/x-sqlite3"
+                    className={inputClass}
+                    id="database-import-file"
+                    onChange={(event) => {
+                      const file = event.target.files?.[0] || null
+                      setDatabaseForm((current) => ({
+                        ...current,
+                        import_file: file,
+                        import_file_name: file
+                          ? file.name.replace(/\.db$/i, '')
+                          : current.import_file_name,
+                      }))
+                    }}
+                    required
+                    type="file"
+                  />
+                </Field>
+                <Field label="Import mode">
+                  <select className={inputClass} onChange={(event) => setDatabaseForm((current) => ({ ...current, import_mode: event.target.value }))} value={databaseForm.import_mode}>
+                    <option value="replace">Replace current database</option>
+                    <option value="merge">Merge (replace matching records)</option>
+                  </select>
+                </Field>
+                <p className="mt-2 text-xs text-amber-800">Replace clears current database records. Merge replaces conflicting records and preserves unrelated ones. Both modes require a matching BPSMS schema.</p>
+                <IconButton className="mt-4 rounded-lg border border-red-300 px-4 py-2 text-sm font-semibold text-red-700 disabled:opacity-60" disabled={busy} type="submit">Import database</IconButton>
+              </form>
+            </div>
+          </section>
+        )}
+
         {activeView === 'settings' && isAdmin && (
           <section className="mb-8 rounded-xl bg-white p-5 shadow-sm ring-1 ring-slate-200" id="settings">
             <h2 className="text-lg font-bold">Production machine settings</h2>
-            <p className="mt-1 text-sm text-slate-500">Manage the machine options available during Sales order entry. Machines assigned to an order cannot be renamed or removed.</p>
-            <div className="mt-5 grid gap-5 lg:grid-cols-3">
+            <p className="mt-1 text-sm text-slate-500">Manage printer brands separately for Sublimation and DTF. Unassigned printer brands are shared; pressing and cutting machines are available to all orders.</p>
+            <div className="mt-5 grid gap-5 lg:grid-cols-2 xl:grid-cols-4">
               {[
-                ['printing', 'Printing machines'],
-                ['pressing', 'Pressing machines'],
-                ['cutting', 'Cutting machines'],
-              ].map(([category, title]) => (
-                <div className="rounded-lg border border-slate-200 p-4" key={category}>
+                { category: 'printing', businessUnit: 'sublimation', title: 'Sublimation printer brands' },
+                { category: 'printing', businessUnit: 'dtf', title: 'DTF printer brands' },
+                { category: 'pressing', businessUnit: null, title: 'Shared machines · Pressing' },
+                { category: 'cutting', businessUnit: null, title: 'Shared machines · Cutting' },
+              ].map(({ category, businessUnit, title }) => {
+                const formKey = category === 'printing' ? `printing_${businessUnit}` : category
+                const sectionMachines = machines.filter((machine) =>
+                  machine.category === category &&
+                  (category !== 'printing' || machine.business_unit === null ||
+                    machine.business_unit === businessUnit),
+                )
+                return (
+                <div className="rounded-lg border border-slate-200 p-4" key={`${category}-${businessUnit ?? 'shared'}`}>
                   <h3 className="font-semibold">{title}</h3>
-                  <form className="mt-3 flex gap-2" onSubmit={(event) => addMachine(event, category)}>
+                  <form className="mt-3 flex gap-2" onSubmit={(event) => addMachine(event, category, businessUnit)}>
                     <input
                       aria-label={`New ${title.toLowerCase()} name`}
                       className={inputClass}
-                      onChange={(event) => setNewMachineNames((current) => ({ ...current, [category]: event.target.value }))}
-                      placeholder="Machine name"
+                      onChange={(event) => setNewMachineNames((current) => ({ ...current, [formKey]: event.target.value }))}
+                      placeholder={category === 'printing' ? 'Printer brand' : 'Machine name'}
                       required
-                      value={newMachineNames[category]}
+                      value={newMachineNames[formKey]}
                     />
                     <IconButton className="mt-1 shrink-0 rounded-lg bg-violet-600 px-3 py-2 text-sm font-semibold text-white hover:bg-violet-700 disabled:opacity-60" disabled={busy} type="submit">Add</IconButton>
                   </form>
                   <ul className="mt-3 divide-y divide-slate-100">
-                    {machines.filter((machine) => machine.category === category).map((machine) => (
+                    {sectionMachines.map((machine) => (
                       <li className="flex flex-wrap items-center justify-between gap-2 py-2" key={machine.id}>
                         {editingMachineId === machine.id ? (
                           <form className="flex w-full gap-2" onSubmit={(event) => updateMachine(event, machine)}>
                             <input className={inputClass} onChange={(event) => setEditingMachineName(event.target.value)} required value={editingMachineName} />
+                            {category === 'printing' && (
+                              <select
+                                aria-label="Printer section"
+                                className={inputClass}
+                                onChange={(event) => setEditingMachineBusinessUnit(event.target.value)}
+                                value={editingMachineBusinessUnit}
+                              >
+                                <option value="sublimation">Sublimation</option>
+                                <option value="dtf">DTF</option>
+                              </select>
+                            )}
                             <IconButton className="rounded border border-violet-300 px-2 py-1 text-xs font-medium text-violet-800" disabled={busy} type="submit">Save</IconButton>
-                            <IconButton className="rounded border border-slate-300 px-2 py-1 text-xs font-medium" onClick={() => setEditingMachineId(null)} type="button">Cancel</IconButton>
+                            <IconButton className="rounded border border-slate-300 px-2 py-1 text-xs font-medium" onClick={() => { setEditingMachineId(null); setEditingMachineBusinessUnit('sublimation') }} type="button">Cancel</IconButton>
                           </form>
                         ) : (
                           <>
-                            <span className="text-sm">{machine.name}</span>
+                            <span className="text-sm">
+                              {machine.name}
+                              {category === 'printing' && machine.business_unit === null && (
+                                <span className="ml-2 text-xs text-slate-500">Shared / unassigned</span>
+                              )}
+                            </span>
                             <div className="flex gap-2">
                               <IconButton className="rounded border border-slate-300 px-2 py-1 text-xs font-medium" onClick={() => {
                                 setEditingMachineId(machine.id)
                                 setEditingMachineName(machine.name)
+                                setEditingMachineBusinessUnit(machine.business_unit ?? businessUnit)
                               }} type="button">Edit</IconButton>
                               <IconButton className="rounded border border-red-300 px-2 py-1 text-xs font-medium text-red-700" disabled={busy} onClick={() => deleteMachine(machine)} type="button">Delete</IconButton>
                             </div>
@@ -3559,12 +4999,13 @@ function App() {
                         )}
                       </li>
                     ))}
-                    {machines.every((machine) => machine.category !== category) && (
+                    {sectionMachines.length === 0 && (
                       <li className="py-2 text-sm text-slate-500">No machines configured.</li>
                     )}
                   </ul>
                 </div>
-              ))}
+                )
+              })}
             </div>
           </section>
         )}
@@ -3727,11 +5168,6 @@ function App() {
                   Close
                 </IconButton>
               </div>
-              {pageError && (
-                <p className="mb-4 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700" role="alert">
-                  {pageError}
-                </p>
-              )}
               {editingStaffId === null ? (
                 <form className="grid gap-3 md:grid-cols-3" onSubmit={createStaff}>
                   <Field label="Name">
@@ -3812,7 +5248,7 @@ function App() {
           </div>
         )}
 
-        {activeView === 'printing' && ['admin', 'print_operator'].includes(user.role) && (
+        {activeView === 'printing' && (isAdmin || user.role === 'print_operator') && (
           <nav aria-label="Printing stages" className="mb-4 flex flex-wrap gap-2">
             {[
               ['printing', 'Printing', orders.filter((order) => order.order_status === 'printing').length],
@@ -3854,7 +5290,7 @@ function App() {
           </div>
         )}
 
-        {isPrintingTestPrints && ['admin', 'print_operator'].includes(user.role) && (
+        {isPrintingTestPrints && (isAdmin || user.role === 'print_operator') && (
           <section className="mb-8 scroll-mt-48 rounded-xl border border-cyan-200 bg-cyan-50 p-5" id="test-prints">
             <h2 className="font-bold text-cyan-950">Test print requests</h2>
             <p className="mt-1 text-sm text-cyan-900">Mock-ups submitted by Artists appear here for Printing.</p>
@@ -3905,7 +5341,7 @@ function App() {
           </section>
         )}
 
-        {isPrintingReprints && ['admin', 'print_operator'].includes(user.role) && (
+        {isPrintingReprints && (isAdmin || user.role === 'print_operator') && (
           <section className="mb-8 scroll-mt-48 rounded-xl border border-amber-200 bg-amber-50 p-5" id="reprints">
             <h2 className="font-bold text-amber-950">Open reprint jobs</h2>
             <p className="mt-1 text-sm text-amber-900">These remain available to Printing even after the main order advances.</p>
@@ -3921,7 +5357,9 @@ function App() {
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <div>
                       <p className="font-semibold">{job.order_id} · {job.team_project_name}</p>
-                      <p className="text-sm text-slate-600">Fabric: {job.fabric_used || '—'}</p>
+                      {job.business_unit !== 'dtf' && job.print_mode !== 'print_only' && (
+                        <p className="text-sm text-slate-600">Fabric: {job.fabric_used || '—'}</p>
+                      )}
                       <p className="text-sm text-slate-600">Reason for reprint: {job.defect_description || '—'}</p>
                       <p className="text-xs text-slate-500">Main order stage: {stageLabels[job.order_status]}</p>
                     </div>
@@ -3930,6 +5368,8 @@ function App() {
                       <IconButton className="rounded border border-emerald-300 px-3 py-2 text-sm font-semibold text-emerald-800" disabled={busy} onClick={() => updateReprint(job.id, 'complete')} type="button">Complete</IconButton>
                     </div>
                   </div>
+                  {job.business_unit !== 'dtf' &&
+                    job.print_mode !== 'print_only' && (
                   <div className="mt-3">
                     <Field label="Note for Pressing (optional)">
                       <textarea
@@ -3944,55 +5384,59 @@ function App() {
                       />
                     </Field>
                   </div>
+                  )}
                   <div className="mt-3 grid gap-3 rounded-lg bg-amber-50 p-3 md:grid-cols-4">
                     {(() => {
                       const formKey = `reprint-${job.id}`
                       const form = stationForms[formKey] || {
                         fabric_used: '',
                         defect_description: '',
-                        consumable_process: 'sublimation',
-                        consumable_brand: 'atexco',
+                        consumable_process: job.business_unit || 'sublimation',
+                        printer_brand: job.printer_machine || '',
+                        consumable_brand: getPrinterStockBrand(job.printer_machine),
                         consumable_usage: {},
                       }
+                      const reprintPrinterOptions = (
+                        machineSelection?.category === 'printing'
+                          ? machineSelection.machines
+                          : machines
+                      ).filter((machine) => machine.category === 'printing' &&
+                        (machine.business_unit == null || machine.business_unit === job.business_unit))
                       return (
                         <>
+                          {job.business_unit !== 'dtf' && job.print_mode !== 'print_only' && (
                           <Field label="Fabric used">
-                            <input className={inputClass} onChange={(event) => setStationForms((current) => ({
-                              ...current,
-                              [formKey]: { ...form, fabric_used: event.target.value },
-                            }))} value={form.fabric_used} />
-                          </Field>
-                          <Field label="Print process">
-                            <select className={inputClass} onChange={(event) => setStationForms((current) => ({
-                              ...current,
-                              [formKey]: { ...form, consumable_process: event.target.value },
-                            }))} value={form.consumable_process}>
-                              <option value="sublimation">Sublimation</option>
-                              <option value="dtf">DTF</option>
-                            </select>
-                          </Field>
-                          {form.consumable_process !== 'dtf' && (
-                            <Field label="Sublimation brand">
-                              <select className={inputClass} onChange={(event) => setStationForms((current) => ({
+                            <FabricOptionSelect
+                              options={fabricOptions}
+                              onChange={(value) => setStationForms((current) => ({
                                 ...current,
-                                [formKey]: { ...form, consumable_brand: event.target.value },
-                              }))} value={form.consumable_brand}>
-                                <option value="atexco">Atexco</option>
-                                <option value="creons">Creons</option>
-                              </select>
-                            </Field>
+                                [formKey]: { ...form, fabric_used: value },
+                              }))}
+                              value={form.fabric_used}
+                            />
+                          </Field>
                           )}
-                          {consumableCatalog
-                            .filter((product) => {
-                              if (product.business_unit !== (form.consumable_process === 'dtf' ? 'dtf' : 'sublimation')) return false
-                              if (product.legacy) return false
-                              if (product.business_unit === 'sublimation' && product.code.startsWith('subli_ink_')) {
-                                return product.code.endsWith(`_${form.consumable_brand || 'atexco'}`)
-                              }
-                              return true
-                            })
+                          <Field label="Print process">
+                            <input className={inputClass} readOnly value={job.business_unit === 'dtf' ? 'DTF' : 'Sublimation'} />
+                          </Field>
+                          <Field label="Printer brand">
+                            <select className={inputClass} onChange={(event) => setStationForms((current) => ({
+                                ...current,
+                                [formKey]: {
+                                  ...form,
+                                  printer_brand: event.target.value,
+                                  consumable_brand: getPrinterStockBrand(event.target.value),
+                                },
+                              }))} required value={form.printer_brand || job.printer_machine || ''}>
+                                <option value="">Select a printer brand</option>
+                                {reprintPrinterOptions.map((machine) => (
+                                  <option key={machine.id} value={machine.name}>{machine.name}</option>
+                                ))}
+                              </select>
+                          </Field>
+                          {getStationConsumableProducts(form)
                             .map((product) => (
-                              <Field key={product.code} label={`${product.label} used (${product.unit})`}>
+                              <Field key={product.code} label={`${product.label} used (${getStationConsumableInputUnit(product)})`}>
                                 <input
                                   className={inputClass}
                                   min="0"
@@ -4006,7 +5450,7 @@ function App() {
                                       },
                                     },
                                   }))}
-                                  step="0.001"
+                                  step="0.01"
                                   type="number"
                                   value={form.consumable_usage?.[product.code] || ''}
                                 />
@@ -4055,13 +5499,15 @@ function App() {
                   <h2 className="text-xl font-bold" id="fabric-inventory-title">Fabric inventory</h2>
                   <p className="mt-1 text-sm text-slate-500">Record roll quantities and calculated total meters. Entries refresh automatically for Pressing, Admin, and the B-POWER Supervisor.</p>
                 </div>
-                <IconButton
-                  className="rounded-lg bg-violet-600 px-4 py-2 text-sm font-semibold text-white"
-                  onClick={() => openFabricEntryModal()}
-                  type="button"
-                >
-                  Add fabric
-                </IconButton>
+                {canEditFabricInventory && (
+                  <IconButton
+                    className="rounded-lg bg-violet-600 px-4 py-2 text-sm font-semibold text-white"
+                    onClick={() => openFabricEntryModal()}
+                    type="button"
+                  >
+                    Add fabric
+                  </IconButton>
+                )}
               </div>
               <div className="mt-4 grid gap-3 sm:grid-cols-2">
                 <Field label="Filter by date">
@@ -4082,24 +5528,25 @@ function App() {
                 </Field>
               </div>
               <div className="mt-4 overflow-x-auto rounded-lg border border-slate-200">
-                <table className="w-full min-w-[1050px] text-left text-sm">
+                <table className="w-full min-w-[1150px] text-left text-sm">
                   <thead className="bg-slate-50 text-xs uppercase text-slate-500">
                     <tr>
                       <th className="px-3 py-2">Date</th>
                       <th className="px-3 py-2">Fabric</th>
+                      <th className="px-3 py-2">Width</th>
                       <th className="px-3 py-2">GSM</th>
                       <th className="px-3 py-2">Roll qty</th>
                       <th className="px-3 py-2">Unit</th>
                       <th className="px-3 py-2">Measurement</th>
                       <th className="px-3 py-2">Total meter</th>
                       <th className="px-3 py-2">Updated by</th>
-                      <th className="px-3 py-2">Actions</th>
+                      {canEditFabricInventory && <th className="px-3 py-2">Actions</th>}
                     </tr>
                   </thead>
                   <tbody>
                     {visibleFabricEntries.length === 0 ? (
                       <tr>
-                        <td className="px-3 py-4 text-slate-500" colSpan="9">
+                        <td className="px-3 py-4 text-slate-500" colSpan={canEditFabricInventory ? 10 : 9}>
                           {fabricEntries.length ? 'No fabric entries match these filters.' : 'No fabric entries recorded.'}
                         </td>
                       </tr>
@@ -4107,6 +5554,7 @@ function App() {
                       <tr className="border-t border-slate-100" key={entry.id}>
                         <td className="whitespace-nowrap px-3 py-2">{entry.entry_date}</td>
                         <td className="px-3 py-2 font-medium">{entry.fabric}</td>
+                        <td className="px-3 py-2">{entry.fabric_width || '—'}</td>
                         <td className="px-3 py-2">{entry.gsm}</td>
                         <td className="px-3 py-2">{entry.roll_quantity}</td>
                         <td className="px-3 py-2">{entry.measurement_type === 'meter' ? 'Meter' : 'Kilo/grams'}</td>
@@ -4117,15 +5565,28 @@ function App() {
                         </td>
                         <td className="px-3 py-2 font-semibold">{Number(entry.total_meter).toLocaleString(undefined, { maximumFractionDigits: 2 })} m</td>
                         <td className="px-3 py-2">{entry.updated_by_name || '—'}</td>
-                        <td className="px-3 py-2">
-                          <IconButton
-                            className="rounded border border-violet-300 px-3 py-1.5 text-xs font-semibold text-violet-800 hover:bg-violet-50"
-                            onClick={() => openFabricEntryModal(entry)}
-                            type="button"
-                          >
-                            Edit
-                          </IconButton>
-                        </td>
+                        {canEditFabricInventory && (
+                          <td className="px-3 py-2">
+                            <div className="flex gap-2">
+                              <IconButton
+                                className="rounded border border-violet-300 px-3 py-1.5 text-xs font-semibold text-violet-800 hover:bg-violet-50"
+                                disabled={busy}
+                                onClick={() => openFabricEntryModal(entry)}
+                                type="button"
+                              >
+                                Edit
+                              </IconButton>
+                              <IconButton
+                                className="rounded border border-red-300 px-3 py-1.5 text-xs font-semibold text-red-700 hover:bg-red-50"
+                                disabled={busy}
+                                onClick={() => deleteFabricEntry(entry)}
+                                type="button"
+                              >
+                                Delete
+                              </IconButton>
+                            </div>
+                          </td>
+                        )}
                       </tr>
                     ))}
                   </tbody>
@@ -4156,6 +5617,15 @@ function App() {
                   ? `${visibleTestPrintJobs.length} request(s)`
                   : `${visibleOrders.length} order(s)`}
             </span>
+            {isBPowerSupervisor && activeView === 'all' && canCrudOrders && (
+              <IconButton
+                className="rounded-lg bg-violet-600 px-4 py-2 text-sm font-semibold text-white"
+                onClick={() => openOrderModalForClient()}
+                type="button"
+              >
+                Create order
+              </IconButton>
+            )}
           </div>
           )}
           {isArtistMockupQueue && (
@@ -4188,9 +5658,9 @@ function App() {
               })}
             </nav>
           )}
-          {isPrintingReprints || isPrintingTestPrints ? null : activeView === 'all' && (isSalesOrAdmin || isArtist) ? (
+          {isPrintingReprints || isPrintingTestPrints ? null : activeView === 'all' && (canCrudOrders || isArtist || isBPowerSupervisor) ? (
             <>
-              {editingOrderId && isSalesOrAdmin && (
+              {editingOrderId && canCrudOrders && (
                 <form className="mb-5 rounded-xl border border-violet-200 bg-white p-5 shadow-sm" onSubmit={updateOrder}>
                   <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
                     <div>
@@ -4211,6 +5681,7 @@ function App() {
                     isAdmin={isAdmin}
                     machines={machines}
                     styleNumberOptions={styleNumberOptions}
+                    fabricOptions={fabricOptions}
                     onChange={(name, value) => setOrderEditForm((current) => {
                       if (name === 'sales_rep_id') {
                         return { ...current, sales_rep_id: value }
@@ -4260,7 +5731,7 @@ function App() {
                     <tbody>
                       {visibleOrders.map((order) => {
                         const client = clients.find((entry) => entry.client_id === order.client_id)
-                        const lineupEnabled = isSalesOrAdmin && Number(order.down_payment) >= paidLayoutFeeThreshold
+                        const lineupEnabled = canCrudOrders && Number(order.down_payment) >= paidLayoutFeeThreshold
                         return (
                           <tr
                             className={`border-t border-slate-100 align-top ${
@@ -4291,7 +5762,7 @@ function App() {
                             <td className="px-3 py-3"><span className="rounded-full bg-violet-50 px-2 py-1 text-xs font-semibold text-violet-800">{order.order_status === 'mockup' && isSalesOrAdmin && Number(order.layout_fee) < paidLayoutFeeThreshold ? 'Awaiting layout fee' : stageLabels[order.order_status]}</span></td>
                             <td className="px-3 py-3">
                               <div className="flex flex-wrap gap-2">
-                                {isSalesOrAdmin ? (
+                                {canCrudOrders ? (
                                   <>
                                     <IconButton className="rounded border border-cyan-300 px-2 py-1 text-xs font-medium text-cyan-800 hover:bg-cyan-50 disabled:opacity-50" disabled={!lineupEnabled} onClick={() => openLineupEditor(order)} title={lineupEnabled ? 'Edit lineup' : 'Down payment must be at least 1 to edit the lineup'} type="button">Lineup</IconButton>
                                     <IconButton className="rounded border border-slate-300 px-2 py-1 text-xs font-medium hover:bg-slate-50" onClick={() => {
@@ -4346,15 +5817,24 @@ function App() {
                 const canWorkStation =
                   isAdmin ||
                   (stationByRole[user.role] && order.order_status === stationByRole[user.role])
+                const printerBrandOptions = (
+                  machineSelection?.category === 'printing'
+                    ? machineSelection.machines
+                    : machines
+                ).filter((machine) => machine.category === 'printing' &&
+                  (machine.business_unit == null || machine.business_unit === order.business_unit))
                 const stationForm = stationForms[order.order_id] || {
                   fabric_used: '',
                   paper_meters: '',
                   defect_description: '',
-                  consumable_process: 'sublimation',
-                  consumable_brand: 'atexco',
+                  consumable_process: order.business_unit || 'sublimation',
+                  printer_brand: order.printer_machine || '',
+                  consumable_brand: getPrinterStockBrand(order.printer_machine),
                   consumable_usage: {},
                   reprint_image: null,
                 }
+                const usageProducts = getStationConsumableProducts(stationForm)
+                const printRequiresFabric = order.business_unit !== 'dtf' && order.print_mode !== 'print_only'
                 const pressingNoteLabels = {
                   stage_completed: 'Printing',
                   reprint_completed: 'Reprint',
@@ -4363,7 +5843,13 @@ function App() {
                 const stationWithoutProductionLog = ['pressing', 'cutting', 'sewing', 'packing'].includes(order.order_status)
 
                 return (
-                  <article className="rounded-xl bg-white p-5 shadow-sm ring-1 ring-slate-200" key={order.order_id}>
+                  <article
+                    aria-label={order.order_status === 'printing' ? `Order ${order.order_id}; paste a usage image here` : undefined}
+                    className="rounded-xl bg-white p-5 shadow-sm ring-1 ring-slate-200"
+                    key={order.order_id}
+                    onPaste={order.order_status === 'printing' ? (event) => pasteUsageImage(event, order) : undefined}
+                    tabIndex={order.order_status === 'printing' ? 0 : undefined}
+                  >
                     <div className="flex flex-wrap items-start justify-between gap-3">
                       <div>
                         <p className="text-xs font-semibold uppercase tracking-wide text-violet-600">{order.order_id} · {order.style_number}</p>
@@ -4404,10 +5890,13 @@ function App() {
                             ['Item', order.item],
                             ['Product category', order.category],
                             ['Fabric / GSM', `${order.fabric} / ${order.gsm} GSM`],
+                            ['Fabric width', order.fabric_width || '—'],
                             ['Quantity', `${order.total_quantity} pieces`],
+                            ['Print process', order.business_unit === 'dtf' ? 'DTF' : 'Sublimation'],
+                            ['Print mode', order.print_mode === 'print_only' ? 'Print only' : 'Print and press'],
                             ['Assigned artist', staff.find((member) => member.id === order.assigned_artist_id)?.name || (order.assigned_artist_id === user.id ? user.name : '—')],
                             ['Sales representative', staff.find((member) => member.id === order.sales_rep_id)?.name || (order.sales_rep_id === user.id ? user.name : '—')],
-                            ['Printer machine', order.printer_machine || '—'],
+                            ['Printer brand', order.printer_machine || '—'],
                             ['Pressing machine', order.pressing_machine || '—'],
                             ['Cutting machine', order.cutting_machine || '—'],
                           ].map(([label, value]) => (
@@ -4522,7 +6011,7 @@ function App() {
                     <div className="mt-4 flex flex-wrap gap-2">
                       {order.spreadsheet_path &&
                         activeView === 'printing' &&
-                        ['admin', 'print_operator'].includes(user.role) && (
+                        (isAdmin || user.role === 'print_operator') && (
                         <IconButton
                           className="rounded border border-cyan-300 px-3 py-2 text-sm font-medium text-cyan-800 hover:bg-cyan-50"
                           onClick={() => openLineupEditor(order)}
@@ -4533,7 +6022,7 @@ function App() {
                       )}
                       {order.spreadsheet_path &&
                         activeView === 'complete' &&
-                        ['admin', 'sales', 'artist'].includes(user.role) && (
+                        (isAdmin || ['sales', 'artist'].includes(user.role)) && (
                         <IconButton
                           className="rounded border border-cyan-300 px-3 py-2 text-sm font-medium text-cyan-800 hover:bg-cyan-50"
                           onClick={() => openLineupEditor(order)}
@@ -4641,73 +6130,128 @@ function App() {
                           {!stationWithoutProductionLog && (
                             <>
                               <div className="mt-4 grid gap-3 md:grid-cols-3">
-                                <Field label="Fabric used">
-                                  <input className={inputClass} onChange={(e) => setStationForms({ ...stationForms, [order.order_id]: { ...stationForm, fabric_used: e.target.value } })} value={stationForm.fabric_used} />
-                                </Field>
-                                <Field label="Print process">
-                                  <select className={inputClass} onChange={(event) => setStationForms({ ...stationForms, [order.order_id]: { ...stationForm, consumable_process: event.target.value } })} value={stationForm.consumable_process}>
-                                    <option value="sublimation">Sublimation</option>
-                                    <option value="dtf">DTF</option>
-                                  </select>
-                                </Field>
-                                {stationForm.consumable_process !== 'dtf' && (
-                                  <Field label="Sublimation brand">
-                                    <select className={inputClass} onChange={(event) => setStationForms({ ...stationForms, [order.order_id]: { ...stationForm, consumable_brand: event.target.value } })} value={stationForm.consumable_brand}>
-                                      <option value="atexco">Atexco</option>
-                                      <option value="creons">Creons</option>
+                                  {printRequiresFabric && (
+                                    <Field label="Fabric used">
+                                      <FabricOptionSelect
+                                        options={fabricOptions}
+                                        onChange={(value) => setStationForms((current) => ({
+                                          ...current,
+                                          [order.order_id]: {
+                                            ...(current[order.order_id] || stationForm),
+                                            fabric_used: value,
+                                          },
+                                        }))}
+                                        value={stationForm.fabric_used}
+                                      />
+                                    </Field>
+                                  )}
+                                  <Field label="Print process">
+                                    <input className={inputClass} readOnly value={order.business_unit === 'dtf' ? 'DTF' : 'Sublimation'} />
+                                  </Field>
+                                  <Field label="Printer brand">
+                                    <select className={inputClass} onChange={(event) => {
+                                      const printerBrand = event.target.value
+                                      setStationForms((current) => ({
+                                        ...current,
+                                        [order.order_id]: {
+                                          ...(current[order.order_id] || stationForm),
+                                          printer_brand: printerBrand,
+                                          consumable_brand: getPrinterStockBrand(printerBrand),
+                                        },
+                                      }))
+                                    }} required value={stationForm.printer_brand || order.printer_machine || ''}>
+                                      <option value="">Select a printer brand</option>
+                                      {printerBrandOptions.map((machine) => (
+                                        <option key={machine.id} value={machine.name}>{machine.name}</option>
+                                      ))}
                                     </select>
                                   </Field>
+                                {order.order_status === 'printing' && (
+                                  <>
+                                    <label className="inline-flex cursor-pointer items-center justify-center self-end rounded border border-cyan-300 px-3 py-2 text-sm font-semibold text-cyan-900 hover:bg-cyan-50">
+                                      Read usage image
+                                      <input
+                                        accept="image/png,image/jpeg"
+                                        aria-label={`Read usage image for ${order.order_id}`}
+                                        className="sr-only"
+                                        onChange={(event) => {
+                                          const image = event.target.files?.[0] || null
+                                          event.target.value = ''
+                                          if (image) extractUsageFromImage(order, image)
+                                        }}
+                                        type="file"
+                                      />
+                                    </label>
+                                    {ocrStatusByOrder[order.order_id] && (
+                                      <span className="self-end pb-2 text-xs text-slate-500" role="status">
+                                        Reading values: {ocrStatusByOrder[order.order_id]}
+                                      </span>
+                                    )}
+                                  </>
                                 )}
-                                {consumableCatalog
-                                  .filter((product) => {
-                                    if (product.business_unit !== (stationForm.consumable_process === 'dtf' ? 'dtf' : 'sublimation')) return false
-                                    if (product.business_unit === 'sublimation' && product.code.startsWith('subli_ink_')) {
-                                      return product.code.endsWith(`_${stationForm.consumable_brand || 'atexco'}`)
-                                    }
-                                    return true
-                                  })
-                                  .map((product) => (
-                                    <Field key={product.code} label={`${product.label} used (${product.unit})`}>
+                                {usageProducts.map((product) => (
+                                    <Field key={product.code} label={`${product.label} used (${getStationConsumableInputUnit(product)})`}>
                                       <input
                                         className={inputClass}
                                         min="0"
-                                        onChange={(event) => setStationForms({
-                                          ...stationForms,
+                                        onChange={(event) => setStationForms((current) => ({
+                                          ...current,
                                           [order.order_id]: {
-                                            ...stationForm,
+                                            ...(current[order.order_id] || stationForm),
                                             consumable_usage: {
-                                              ...stationForm.consumable_usage,
+                                              ...(current[order.order_id]?.consumable_usage || stationForm.consumable_usage),
                                               [product.code]: event.target.value,
                                             },
                                           },
-                                        })}
+                                        }))}
                                         step="0.01"
                                         type="number"
-                                        value={stationForm.consumable_usage?.[product.code] || ''}
+                                        value={stationForm.consumable_usage?.[product.code] ?? ''}
                                       />
                                     </Field>
-                                  ))}
+                                ))}
                                 <Field label="Defect / production issue">
                                   <input className={inputClass} onChange={(e) => setStationForms({ ...stationForms, [order.order_id]: { ...stationForm, defect_description: e.target.value } })} placeholder="Leave blank if none" value={stationForm.defect_description} />
                                 </Field>
                                 <IconButton className="self-end rounded border border-violet-300 px-3 py-2 text-sm font-semibold text-violet-800" disabled={busy} onClick={() => stationAction(order, 'station-log')} type="button">Log production / defect</IconButton>
                               </div>
-                              {(order.station_logs || []).filter((entry) => entry.station === order.order_status && !entry.reprint_job_id).length > 0 && (
-                            <ul className="mt-3 space-y-1 text-xs text-slate-600">
-                              {(order.station_logs || [])
-                                .filter((entry) => entry.station === order.order_status && !entry.reprint_job_id)
-                                .map((entry) => (
-                                  <li key={entry.id}>
-                                    {entry.fabric_used && `Fabric: ${entry.fabric_used} · `}
-                                    {entry.paper_meters} m paper · {entry.operator} · {entry.created_at}
-                                    {entry.defect_description && <span className="block text-amber-800">Defect: {entry.defect_description}</span>}
-                                  </li>
-                                ))}
-                            </ul>
+                              {(order.station_logs || []).some((entry) => entry.station === order.order_status && !entry.reprint_job_id) && (
+                                <div className="mt-3 overflow-x-auto rounded-lg border border-slate-200 bg-white">
+                                  <table className="w-full min-w-[850px] text-left text-xs">
+                                    <thead className="bg-slate-100 uppercase text-slate-500">
+                                      <tr>
+                                        <th className="px-3 py-2">Recorded</th>
+                                        <th className="px-3 py-2">Operator</th>
+                                        <th className="px-3 py-2">Printer brand</th>
+                                        <th className="px-3 py-2">Input</th>
+                                        <th className="px-3 py-2">Quantity</th>
+                                        <th className="px-3 py-2">Fabric / paper</th>
+                                        <th className="px-3 py-2">Defect / issue</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {(order.station_logs || [])
+                                        .filter((entry) => entry.station === order.order_status && !entry.reprint_job_id)
+                                        .flatMap((entry) => (entry.production_items?.length ? entry.production_items : [null]).map((item) => (
+                                          <tr className="border-t border-slate-100" key={`${entry.id}-${item?.id || 'summary'}`}>
+                                            <td className="px-3 py-2">{entry.created_at}</td>
+                                            <td className="px-3 py-2">{entry.operator}</td>
+                                            <td className="px-3 py-2">{entry.printer_brand || '—'}</td>
+                                            <td className="px-3 py-2">{item?.label || '—'}</td>
+                                            <td className="px-3 py-2">{item ? `${Number(item.quantity)} ${item.unit}` : '—'}</td>
+                                            <td className="px-3 py-2">{[entry.fabric_used && `Fabric: ${entry.fabric_used}`, Number(entry.paper_meters || 0) > 0 && `Paper: ${entry.paper_meters} m`].filter(Boolean).join(' · ') || '—'}</td>
+                                            <td className="px-3 py-2 text-amber-800">{entry.defect_description || '—'}</td>
+                                          </tr>
+                                        )))}
+                                    </tbody>
+                                  </table>
+                                </div>
                               )}
                             </>
                           )}
-                          {order.order_status === 'printing' && (
+                          {order.order_status === 'printing' &&
+                            order.business_unit !== 'dtf' &&
+                            order.print_mode !== 'print_only' && (
                             <Field label="Note for Pressing (optional)">
                               <textarea
                                 className={inputClass}
@@ -4722,7 +6266,9 @@ function App() {
                             </Field>
                           )}
                           <IconButton className="mt-4 rounded bg-emerald-600 px-3 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={busy} onClick={() => stationAction(order, 'complete-stage')} type="button">
-                            Complete {stageLabels[order.order_status]} and hand off
+                            {order.order_status === 'printing' && order.print_mode === 'print_only'
+                              ? 'Complete printing'
+                              : `Complete ${stageLabels[order.order_status]} and hand off`}
                           </IconButton>
                         </div>
                       )}
@@ -4730,14 +6276,18 @@ function App() {
                       {(
                         (['pressing', 'cutting', 'sewing', 'packing'].includes(order.order_status) &&
                           (isAdmin || stationByRole[user.role] === order.order_status)) ||
-                        (['admin', 'print_operator'].includes(user.role) &&
+                        ((isAdmin || user.role === 'print_operator') &&
                           stageSequence.indexOf(order.order_status) > stageSequence.indexOf('printing') &&
                           order.order_status !== 'complete')
                       ) && (
                         <div className="mt-2 grid w-full gap-3 rounded-lg bg-amber-50 p-4 md:grid-cols-4">
-                          <Field label="Fabric used">
-                            <input className={inputClass} onChange={(e) => setStationForms({ ...stationForms, [order.order_id]: { ...stationForm, fabric_used: e.target.value } })} value={stationForm.fabric_used} />
-                          </Field>
+                          {printRequiresFabric && <Field label="Fabric used">
+                            <FabricOptionSelect
+                              options={fabricOptions}
+                              onChange={(value) => setStationForms({ ...stationForms, [order.order_id]: { ...stationForm, fabric_used: value } })}
+                              value={stationForm.fabric_used}
+                            />
+                          </Field>}
                           <Field label="Reason for reprint">
                             <input className={inputClass} onChange={(e) => setStationForms({ ...stationForms, [order.order_id]: { ...stationForm, defect_description: e.target.value } })} placeholder="Describe the issue to reprint" value={stationForm.defect_description} />
                           </Field>
@@ -4753,7 +6303,7 @@ function App() {
                               type="file"
                             />
                           </Field>
-                          <IconButton className="self-end rounded bg-amber-700 px-3 py-2 text-sm font-semibold text-white" disabled={busy || !stationForm.fabric_used?.trim() || !stationForm.defect_description?.trim()} onClick={() => stationAction(order, 'reprint-log')} type="button">Log a reprint</IconButton>
+                          <IconButton className="self-end rounded bg-amber-700 px-3 py-2 text-sm font-semibold text-white" disabled={busy || (printRequiresFabric && !stationForm.fabric_used?.trim()) || !stationForm.defect_description?.trim()} onClick={() => stationAction(order, 'reprint-log')} type="button">Log a reprint</IconButton>
                         </div>
                       )}
                       <IconButton className="rounded border border-slate-300 px-3 py-2 text-sm font-medium hover:bg-slate-50" onClick={() => toggleActivity(order.order_id)} type="button">
@@ -4807,9 +6357,14 @@ function App() {
             title: 'Order information',
             fields: [
               ['Client', order.client_company_name || order.client_id],
+              ['Client contact', order.client_contact_person],
+              ['Contact number', order.client_contact_number],
+              ['Shipping address', order.client_shipping_address],
               ...(isSalesOrAdmin ? [['Layout fee', order.layout_fee]] : []),
               ['Order date', order.order_date],
               ['Due date', order.due_date],
+              ['Print process', order.business_unit === 'dtf' ? 'DTF' : 'Sublimation'],
+              ['Print mode', order.print_mode === 'print_only' ? 'Print only' : 'Print and press'],
               ['Team / project name', order.team_project_name],
               ['Item', order.item],
               ['Style number (C1-C7)', order.style_number],
@@ -4834,7 +6389,7 @@ function App() {
             fields: [
               ['Sales representative', order.sales_rep_name || staff.find((member) => member.id === order.sales_rep_id)?.name || (order.sales_rep_id === user.id ? user.name : '—')],
               ['Assigned artist', staff.find((member) => member.id === order.assigned_artist_id)?.name || '—'],
-              ['Printer machine', order.printer_machine],
+              ['Printer brand', order.printer_machine],
               ['Pressing machine', order.pressing_machine],
               ['Cutting machine', order.cutting_machine],
               ...(isSalesOrAdmin ? [['Down payment (for sizing)', order.down_payment]] : []),
@@ -4865,7 +6420,7 @@ function App() {
               <header className="flex flex-wrap items-start justify-between gap-3">
                 <div>
                   <h2 className="text-xl font-bold" id="completed-order-title">
-                    Completed order · {order.order_id}
+                    Order details · {order.order_id}
                   </h2>
                   <p className="mt-1 text-sm text-slate-600">
                     {order.team_project_name} · {stageLabels[order.order_status]}
@@ -4885,7 +6440,7 @@ function App() {
                     }}
                     type="button"
                   >
-                    Print completed order
+                    Print order details
                   </IconButton>
                   <IconButton
                     className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium hover:bg-slate-50"
@@ -4897,11 +6452,6 @@ function App() {
                 </div>
               </header>
 
-              {completedOrderDetails.error && (
-                <p className="mt-4 rounded-lg bg-red-50 p-3 text-sm text-red-700" role="alert">
-                  Unable to load order consumption: {completedOrderDetails.error}
-                </p>
-              )}
               <section className="mt-5 space-y-4 rounded-lg border border-slate-200 p-4">
                 <h3 className="text-sm font-bold">Order details</h3>
                 {orderDetailGroups.map(({ title, fields }) => (
@@ -4920,12 +6470,11 @@ function App() {
               </section>
 
               <section className="mt-5 rounded-lg border border-slate-200 p-4">
-                <h3 className="text-sm font-bold">Attachments</h3>
-                <div className="mt-3 grid gap-4 md:grid-cols-3">
+                <h3 className="text-sm font-bold">Order files</h3>
+                <div className="mt-3 grid gap-4 md:grid-cols-2">
                   {[
                     ['Line-up', 'lineup', order.spreadsheet_path],
-                    ['Mock-up', 'mockup', order.mockup_path],
-                    ['Swatch', 'swatch', order.swatch_path],
+                    ['Printing production spreadsheet', 'production-spreadsheet', order.production_spreadsheet_path],
                   ].map(([label, kind, filePath]) => (
                     <div className="rounded-lg border border-slate-200 p-3" key={kind}>
                       <h4 className="text-sm font-semibold">{label}</h4>
@@ -4993,34 +6542,50 @@ function App() {
               </section>
 
               <section className="mt-5 rounded-lg border border-slate-200 p-4">
-                <h3 className="text-sm font-bold">Order consumption</h3>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h3 className="text-sm font-bold">Order production log</h3>
+                  {order.production_spreadsheet_path && (
+                    <a
+                      className="rounded border border-cyan-300 px-3 py-2 text-sm font-medium text-cyan-800 hover:bg-cyan-50"
+                      href={`/api/orders/${encodeURIComponent(order.order_id)}/files/production-spreadsheet`}
+                    >
+                      Download XLSX
+                    </a>
+                  )}
+                </div>
                 {completedOrderDetails.loading ? (
                   <p className="mt-3 text-sm text-slate-500">Loading production consumption…</p>
                 ) : consumptionLogs.length === 0 ? (
                   <p className="mt-3 text-sm text-slate-500">No production consumption has been recorded.</p>
                 ) : (
                   <div className="mt-3 overflow-x-auto">
-                    <table className="w-full min-w-[700px] text-left text-sm">
+                    <table className="w-full min-w-[1050px] text-left text-sm">
                       <thead className="bg-slate-50 text-xs uppercase text-slate-500">
                         <tr>
                           <th className="px-3 py-2">Stage</th>
-                          <th className="px-3 py-2">Fabric used</th>
-                          <th className="px-3 py-2">Paper used</th>
+                          <th className="px-3 py-2">Printer brand</th>
+                          <th className="px-3 py-2">Input</th>
+                          <th className="px-3 py-2">Quantity</th>
+                          <th className="px-3 py-2">Fabric / paper</th>
                           <th className="px-3 py-2">Operator</th>
                           <th className="px-3 py-2">Recorded</th>
                           <th className="px-3 py-2">Defect / issue</th>
                         </tr>
                       </thead>
                       <tbody>
-                        {consumptionLogs.map((entry) => (
-                          <tr className="border-t border-slate-100" key={entry.id}>
-                            <td className="px-3 py-2">{stageLabels[entry.station] || entry.station}</td>
-                            <td className="px-3 py-2">{entry.fabric_used || '—'}</td>
-                            <td className="px-3 py-2">{Number(entry.paper_meters || 0)} m</td>
-                            <td className="px-3 py-2">{entry.operator}</td>
-                            <td className="whitespace-nowrap px-3 py-2">{entry.created_at}</td>
-                            <td className="px-3 py-2">{entry.defect_description || '—'}</td>
-                          </tr>
+                        {consumptionLogs.flatMap((entry) => (
+                          (entry.production_items?.length ? entry.production_items : [null]).map((item) => (
+                            <tr className="border-t border-slate-100" key={`${entry.id}-${item?.id || 'summary'}`}>
+                              <td className="px-3 py-2">{stageLabels[entry.station] || entry.station}</td>
+                              <td className="px-3 py-2">{entry.printer_brand || '—'}</td>
+                              <td className="px-3 py-2">{item?.label || '—'}</td>
+                              <td className="px-3 py-2">{item ? `${Number(item.quantity)} ${item.unit}` : '—'}</td>
+                              <td className="px-3 py-2">{[entry.fabric_used && `Fabric: ${entry.fabric_used}`, Number(entry.paper_meters || 0) > 0 && `Paper: ${entry.paper_meters} m`].filter(Boolean).join(' · ') || '—'}</td>
+                              <td className="px-3 py-2">{entry.operator}</td>
+                              <td className="whitespace-nowrap px-3 py-2">{entry.created_at}</td>
+                              <td className="px-3 py-2">{entry.defect_description || '—'}</td>
+                            </tr>
+                          ))
                         ))}
                       </tbody>
                     </table>
@@ -5051,9 +6616,6 @@ function App() {
                     </div>
                     <IconButton className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium hover:bg-slate-50" onClick={() => setLineupEditor(null)} type="button">Close</IconButton>
                   </header>
-                  {lineupEditor.error && (
-                    <p className="mx-4 mt-4 rounded-lg bg-red-50 p-3 text-sm text-red-700 sm:mx-5">{lineupEditor.error}</p>
-                  )}
                   {lineupEditor.loading ? (
                     <p className="p-8 text-center text-sm text-slate-500">Loading spreadsheet…</p>
                   ) : (
@@ -5064,7 +6626,7 @@ function App() {
                             accept=".csv,.xlsx"
                             className={inputClass}
                             disabled={!canEditLineup || busy}
-                            onChange={(event) => updateLineupEditor({ file: event.target.files?.[0] || null, error: '' })}
+                            onChange={(event) => updateLineupEditor({ file: event.target.files?.[0] || null })}
                             type="file"
                           />
                         </Field>
@@ -5217,7 +6779,7 @@ function App() {
           </section>
         </div>
       )}
-      {isFabricEntryModalOpen && ['admin', 'pressing_operator'].includes(user.role) && (
+      {isFabricEntryModalOpen && canEditFabricInventory && (
         <div
           className="fixed inset-0 z-[60] flex items-center justify-center overflow-y-auto bg-slate-950/60 p-4"
           onClick={(event) => {
@@ -5253,6 +6815,16 @@ function App() {
                   onChange={(event) => setFabricEntryForm((current) => ({ ...current, fabric: event.target.value }))}
                   required
                   value={fabricEntryForm.fabric}
+                />
+              </Field>
+              <Field label="Fabric width (include unit)">
+                <input
+                  className={inputClass}
+                  maxLength="50"
+                  onChange={(event) => setFabricEntryForm((current) => ({ ...current, fabric_width: event.target.value }))}
+                  placeholder="For example: 60 in or 150 cm"
+                  required
+                  value={fabricEntryForm.fabric_width}
                 />
               </Field>
               <Field label="GSM">

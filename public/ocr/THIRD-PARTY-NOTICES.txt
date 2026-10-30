@@ -1,0 +1,7 @@
+Local OCR assets:
+
+Tesseract.js 7.0.0 and tesseract.js-core 7.0.0 are distributed under the
+Apache License 2.0. Their license texts are included beside these assets.
+
+English traineddata is provided by @tesseract.js-data/eng 1.0.0 under the
+MIT License.
